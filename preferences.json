@@ -1,0 +1,60 @@
+[
+  {
+    "type": "text",
+    "label": "Loader Bar",
+    "margin": "20px 0 12px 0",
+    "size": "16px"
+  },
+  {
+    "property": "uc.loadbar.color-source",
+    "label": "Loader bar color source",
+    "type": "dropdown",
+    "placeholder": "Zen Primary",
+    "defaultValue": "zen",
+    "options": [
+      {
+        "label": "Zen Primary",
+        "value": "zen"
+      },
+      {
+        "label": "Page Foreground",
+        "value": "page-foreground"
+      },
+      {
+        "label": "Page Background",
+        "value": "page-background"
+      },
+      {
+        "label": "Custom Color",
+        "value": "custom"
+      }
+    ]
+  },
+  {
+    "property": "uc.loadbar.color",
+    "label": "Custom loader bar color",
+    "type": "string",
+    "defaultValue": "#3b82f6"
+  },
+  {
+    "property": "uc.loadbar.height",
+    "label": "Loader bar height",
+    "type": "string",
+    "defaultValue": "2px"
+  },
+  {
+    "property": "uc.loadbar.centerbar",
+    "label": "Center Bar with Fading animation",
+    "type": "checkbox"
+  },
+  {
+    "property": "uc.loadbar.roundedcorner",
+    "label": "Whether use rounded corner for load bar or not",
+    "type": "checkbox"
+  },
+  {
+    "property": "uc.loadbar.shadow",
+    "label": "Whether use shadow for load bar or not",
+    "type": "checkbox"
+  }
+]

@@ -1,0 +1,127 @@
+@import "styles/loadbar.css";
+
+:root {
+    --blended-addressbar-frame-gap: 5px;
+    --blended-addressbar-frame-radius: 14px;
+    --blended-addressbar-frame-shadow:
+        0 10px 24px rgba(0, 0, 0, 0.10),
+        0 1px 4px rgba(0, 0, 0, 0.10);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --blended-addressbar-frame-shadow:
+            0 12px 28px rgba(0, 0, 0, 0.30),
+            0 1px 5px rgba(0, 0, 0, 0.28);
+    }
+}
+
+/* URL bar */
+
+/* Only in single toolbar mode */
+:root:not([zen-single-toolbar="true"]) {
+
+    /* Wrapper */
+
+    #zen-appcontent-wrapper {
+        z-index: 3;
+        margin: var(--blended-addressbar-frame-gap) var(--blended-addressbar-frame-gap) var(--blended-addressbar-frame-gap) 0 !important;
+        box-shadow: var(--blended-addressbar-frame-shadow);
+        border-radius: var(--blended-addressbar-frame-radius);
+        overflow: hidden;
+        isolation: isolate;
+        
+    }
+
+    @media -moz-pref("zen.tabs.vertical.right-side") {
+        #zen-appcontent-wrapper {
+            margin: var(--blended-addressbar-frame-gap) 0 var(--blended-addressbar-frame-gap) var(--blended-addressbar-frame-gap) !important;
+        }
+    }
+
+    &:has([zen-compact-mode="true"]) {
+        #zen-appcontent-wrapper {
+            margin: var(--blended-addressbar-frame-gap) !important;
+        }
+    }
+    
+    #tabbrowser-tabpanels,
+    #tabbrowser-tabbox {
+        overflow: hidden;
+    }
+    /* The URL bar with bookmarks */
+    #zen-appcontent-navbar-wrapper {
+        background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+        box-shadow: none;
+        color: var(--zen-tab-header-foreground, inherit);
+        fill: currentColor;
+        --toolbox-textcolor: currentColor;
+        --toolbarbutton-icon-fill: currentColor;
+        --toolbar-color: currentColor;
+        --toolbar-field-color: currentColor;
+
+        transition: background-color 100ms linear;
+
+        #nav-bar-customization-target,
+        #PersonalToolbar,
+        #PanelUI-button {
+            -moz-window-dragging: drag;
+            color: var(--zen-tab-header-foreground, inherit);
+            fill: currentColor;
+            --toolbox-textcolor: currentColor;
+            --toolbarbutton-icon-fill: currentColor;
+            --toolbar-color: currentColor;
+            --toolbar-field-color: currentColor;
+            
+        }
+    }
+
+    &:has([zen-compact-mode="true"]) #zen-appcontent-navbar-wrapper {
+        :is(toolbarbutton, .toolbarbutton-1, .toolbarbutton-icon, .urlbar-icon) {
+            color: inherit !important;
+            fill: currentColor !important;
+            --toolbarbutton-icon-fill: currentColor;
+        }
+    }
+
+    #nav-bar {
+        margin-inline-end: 0 !important;
+        padding-inline-start: var(--zen-element-separation) !important;
+        padding-inline-end: var(--zen-element-separation) !important;
+    }
+    #nav-bar,
+    #PersonalToolbar {
+        box-shadow: 0 -1px 0 0 inset rgba(128,128,128, 0.09);
+    }
+
+    /* The webpage content wrapper */
+    #zen-tabbox-wrapper {
+        margin: 0 !important;
+        
+    }
+    
+    /* Hide shadow and border - they are now in a parent element */
+    #tabbrowser-tabbox #tabbrowser-tabpanels .browserSidebarContainer {
+        :root:not([zen-no-padding="true"]) &:not(.zen-glance-overlay) {
+            --zen-native-inner-radius: 0 0 var(--zen-native-inner-radius) var(--zen-native-inner-radius);
+            --zen-big-shadow: none;
+        }
+    }
+    
+    /* Glance  modification*/
+    .browserSidebarContainer.zen-glance-background.deck-selected {
+         transform: scale(1) !important;
+    }
+
+    .zen-glance-overlay .browserContainer {
+         height: 98% !important;
+    }
+    .urlbar-background {
+        --zen-toolbar-element-bg: transparent;
+    }
+
+    /* Sidebar */
+    #sidebar-box {
+        border-radius: 0 !important;
+    }
+}
