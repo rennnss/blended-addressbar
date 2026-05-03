@@ -12,6 +12,7 @@
     max-width: 100% !important;
     width: var(--bar-pcent) !important; /* Ensure full width or customizable width */
     background-color: var(--bar-colour, var(--blended-addressbar-loadbar-color, var(--zen-primary-color))) !important; /* Solid color for the bar */
+    opacity: var(--blended-addressbar-loadbar-opacity, 0.85) !important;
     @media (-moz-bool-pref: "uc.loadbar.shadow") {
       filter: drop-shadow(0px 0px 10px black) !important;
     }

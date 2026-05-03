@@ -7,10 +7,10 @@ Blended Addressbar is a Zen Browser mod that reshapes the dual-toolbar addressba
 ## Features
 
 - Adaptive addressbar background and foreground colors from active-page semantic colors.
+- Readability guardrails for adaptive foreground colors.
 - Compact framed browser surface with subtle spacing, radius, and shadow.
 - Compact-mode toolbar icon colors that follow the addressbar foreground.
-- Preference-driven loading bar height and color source.
-- Native Zen icons preserved.
+- Preference-driven loading bar height, opacity, and color source.
 
 ## Preferences
 
@@ -19,6 +19,7 @@ The mod exposes its settings through `preferences.json`.
 - `uc.loadbar.color-source`: choose Zen primary color, page foreground, page background, or a custom color.
 - `uc.loadbar.color`: custom loading bar color.
 - `uc.loadbar.height`: loading bar height.
+- `uc.loadbar.opacity`: loading bar opacity as a percentage.
 - `uc.loadbar.centerbar`: center the loading animation.
 - `uc.loadbar.roundedcorner`: enable rounded loading bar corners.
 - `uc.loadbar.shadow`: enable loading bar shadow.

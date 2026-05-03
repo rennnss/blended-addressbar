@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Blended Addressbar
 // @description    Adaptive header color for Zen URL bar
-// @version        0.8.0
+// @version        0.8.11
 // ==/UserScript==
 
 (() => {
@@ -15,14 +15,25 @@
   const samplingIntervalMs = 120;
   const postLoadSamplingIntervalMs = 200;
   const postLoadSamplingEnabled = true;
+  const earlyThemeUpdateDelays = [0, 50, 120, 250, 500, 900, 1400];
+  const settledThemeUpdateDelays = [50, 300, 1000];
+  const viewportThemeUpdateDelays = [0, 100, 300, 700];
+  const loadingThemePollFastIntervalMs = 140;
+  const loadingThemePollSlowIntervalMs = 650;
+  const loadingThemePollAggressiveWindowMs = 3500;
+  const loadingThemePollMaxMs = 45000;
+  const themeBridgeTimeoutMs = 250;
   const themeMessageName = 'blended-addressbar:theme-response';
   const loadbarPrefBranch = 'uc.loadbar.';
   const loadbarHeightPref = `${loadbarPrefBranch}height`;
+  const loadbarOpacityPref = `${loadbarPrefBranch}opacity`;
   const loadbarColorPref = `${loadbarPrefBranch}color`;
   const loadbarColorSourcePref = `${loadbarPrefBranch}color-source`;
   const chromeDoc = document;
+  const themeCache = new WeakMap();
   let themeRequestSeq = 0;
   let servicesModule = null;
+  let lastThemeKey = null;
 
   const setVar = (value, foreground) => {
     chromeDoc.documentElement.style.setProperty('--zen-tab-header-background', value || 'transparent');
@@ -58,6 +69,44 @@
       fg: theme.fg,
       candidates: theme.candidates || null
     });
+  }
+
+  function getBrowserHref(browser) {
+    return browser?.currentURI?.spec || '';
+  }
+
+  function getThemeKey(theme) {
+    return `${theme?.bg || ''}|${theme?.fg || ''}`;
+  }
+
+  function cacheTheme(browser, theme) {
+    if (!browser || !theme?.bg) return;
+    themeCache.set(browser, {
+      href: theme.href || getBrowserHref(browser),
+      theme
+    });
+  }
+
+  function getCachedTheme(browser) {
+    const cached = browser ? themeCache.get(browser) : null;
+    if (!cached || cached.href !== getBrowserHref(browser)) return null;
+    return cached.theme?.bg ? cached.theme : null;
+  }
+
+  function applyResolvedTheme(browser, theme, reason, expectedHref = null) {
+    if (!theme?.bg || !browser || browser !== gBrowser?.selectedBrowser) return false;
+    if (expectedHref && getBrowserHref(browser) !== expectedHref) return false;
+
+    cacheTheme(browser, theme);
+
+    const key = getThemeKey(theme);
+    if (key !== lastThemeKey) {
+      lastThemeKey = key;
+      lastCss = theme.bg;
+      applyTheme(theme, reason);
+    }
+
+    return true;
   }
 
   function getPrefs() {
@@ -113,6 +162,21 @@
     return cssSupports('color', raw) ? raw : fallback;
   }
 
+  function normalizeOpacity(value, fallback) {
+    const raw = String(value || '').trim();
+    if (!raw) return fallback;
+
+    const match = raw.match(/^(\d+(?:\.\d+)?)\s*(%)?$/);
+    if (!match) return fallback;
+
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount)) return fallback;
+
+    const alpha = (match[2] || amount > 1) ? amount / 100 : amount;
+    const clamped = Math.max(0, Math.min(1, alpha));
+    return `${Math.round(clamped * 1000) / 1000}`;
+  }
+
   function setPageLoadbarColors(theme) {
     const root = chromeDoc.documentElement;
     if (hasVisibleColor(theme?.bg)) {
@@ -137,6 +201,7 @@
   function applyLoadbarPrefs() {
     const root = chromeDoc.documentElement;
     const height = normalizeCssLength(readStringPref(loadbarHeightPref, '2px'), '2px');
+    const opacity = normalizeOpacity(readStringPref(loadbarOpacityPref, '85'), '0.85');
     const customColor = normalizeCssColor(readStringPref(loadbarColorPref, '#3b82f6'), '#3b82f6');
     const colorSource = readStringPref(loadbarColorSourcePref, 'zen');
 
@@ -148,11 +213,13 @@
     }[colorSource] || 'var(--zen-primary-color)';
 
     root.style.setProperty('--blended-addressbar-loadbar-height', height);
+    root.style.setProperty('--blended-addressbar-loadbar-opacity', opacity);
     root.style.setProperty('--blended-addressbar-loadbar-custom-color', customColor);
     root.style.setProperty('--blended-addressbar-loadbar-color', colorValue);
 
     if (DEBUG_THEME) {
       root.setAttribute('data-blended-addressbar-loadbar-height', height);
+      root.setAttribute('data-blended-addressbar-loadbar-opacity', opacity);
       root.setAttribute('data-blended-addressbar-loadbar-color-source', colorSource);
       root.setAttribute('data-blended-addressbar-loadbar-custom-color', customColor);
     }
@@ -182,24 +249,52 @@
     } catch {}
   }
 
-  function chooseForeground({ r, g, b }) {
+  function getRelativeLuminance({ r, g, b }) {
     const toLinear = (c) => {
       const v = c / 255;
       return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
     };
-    const luminance = 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+    return 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+  }
+
+  function getContrastRatio(colorA, colorB) {
+    const lumA = getRelativeLuminance(colorA);
+    const lumB = getRelativeLuminance(colorB);
+    const lighter = Math.max(lumA, lumB);
+    const darker = Math.min(lumA, lumB);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  function chooseForeground({ r, g, b }) {
+    const luminance = getRelativeLuminance({ r, g, b });
     return luminance > 0.6 ? 'rgba(11, 13, 16, 0.92)' : 'rgba(245, 247, 251, 0.96)';
   }
 
   function parseCssRgb(input) {
     if (!input) return null;
-    const m = String(input).trim().match(/^rgba?\(([^)]+)\)$/i);
+    const raw = String(input).trim();
+    const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
+    if (hex) {
+      const value = hex[1];
+      const expand = (part) => part.length === 1 ? `${part}${part}` : part;
+      const r = parseInt(expand(value.length <= 4 ? value[0] : value.slice(0, 2)), 16);
+      const g = parseInt(expand(value.length <= 4 ? value[1] : value.slice(2, 4)), 16);
+      const b = parseInt(expand(value.length <= 4 ? value[2] : value.slice(4, 6)), 16);
+      return { r, g, b };
+    }
+
+    const m = raw.match(/^rgba?\(([^)]+)\)$/i);
     if (!m) return null;
-    const parts = m[1].split(',').map(s => s.trim());
+    const parts = m[1].replace(/\s*\/\s*[\d.]+%?$/, '').split(/[,\s]+/).filter(Boolean);
     if (parts.length < 3) return null;
-    const r = Math.max(0, Math.min(255, parseInt(parts[0], 10)));
-    const g = Math.max(0, Math.min(255, parseInt(parts[1], 10)));
-    const b = Math.max(0, Math.min(255, parseInt(parts[2], 10)));
+    const readChannel = (part) => {
+      const value = parseFloat(part);
+      const scaled = String(part).trim().endsWith('%') ? value * 2.55 : value;
+      return Math.max(0, Math.min(255, Math.round(scaled)));
+    };
+    const r = readChannel(parts[0]);
+    const g = readChannel(parts[1]);
+    const b = readChannel(parts[2]);
     return { r, g, b };
   }
 
@@ -211,6 +306,20 @@
     return true;
   }
 
+  function extractCssColor(input) {
+    const value = String(input || '').trim();
+    if (!value || value === 'none') return null;
+
+    const candidates = value.match(/rgba?\([^)]*\)|hsla?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
+    return candidates.find(color => hasVisibleColor(color) && cssSupports('color', color)) || null;
+  }
+
+  function getStyleBackground(style) {
+    if (!style) return null;
+    if (hasVisibleColor(style.backgroundColor)) return style.backgroundColor;
+    return extractCssColor(style.backgroundImage);
+  }
+
   function describeElementTheme(view, element) {
     if (!view || !element) {
       return { found: false, bg: null, fg: null };
@@ -219,44 +328,321 @@
     const style = view.getComputedStyle(element);
     return {
       found: true,
-      bg: style.backgroundColor || null,
+      bg: getStyleBackground(style),
       fg: style.color || null
     };
   }
 
-  function getThemeFromElement(view, element, source = 'element') {
+  function getViewportSize(view, doc = null) {
+    const root = doc?.documentElement || view?.document?.documentElement || null;
+    return {
+      width: view?.innerWidth || root?.clientWidth || 0,
+      height: view?.innerHeight || root?.clientHeight || 0
+    };
+  }
+
+  function rectIntersectsViewport(view, rect) {
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+
+    const { width, height } = getViewportSize(view);
+    if (!width || !height) return true;
+
+    return rect.right > 0
+      && rect.bottom > 0
+      && rect.left < width
+      && rect.top < height;
+  }
+
+  function isRenderedElement(view, element) {
+    if (!view || !element) return false;
+    const style = view.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+      return false;
+    }
+
+    const rects = element.getClientRects();
+    for (const rect of rects) {
+      if (rectIntersectsViewport(view, rect)) return true;
+    }
+
+    return false;
+  }
+
+  function getFirstRenderedElement(view, doc, selector) {
+    const elements = doc?.querySelectorAll?.(selector) || [];
+    for (const element of elements) {
+      if (isRenderedElement(view, element)) return element;
+    }
+
+    return doc?.querySelector?.(selector) || null;
+  }
+
+  function getTopVisibleElement(view, doc) {
+    if (!view || !doc) return null;
+
+    const { width, height } = getViewportSize(view, doc);
+    const xMid = Math.max(1, Math.floor((width || 2) / 2));
+    const xEnd = Math.max(1, (width || 2) - 2);
+    const yTop = Math.min(3, Math.max(0, (height || 4) - 1));
+    const yBand = Math.min(30, Math.max(0, (height || 31) - 1));
+    const points = [
+      [1, yTop],
+      [xMid, yTop],
+      [xEnd, yTop],
+      [1, yBand],
+      [xMid, yBand]
+    ];
+
+    let firstRendered = null;
+    for (const [x, y] of points) {
+      const elements = typeof doc.elementsFromPoint === 'function'
+        ? doc.elementsFromPoint(x, y)
+        : (typeof doc.elementFromPoint === 'function' ? [doc.elementFromPoint(x, y)] : []);
+
+      for (const element of elements) {
+        if (!isRenderedElement(view, element)) continue;
+        firstRendered ||= element;
+
+        const background = getStyleBackground(view.getComputedStyle(element));
+        if (hasVisibleColor(background)) return element;
+      }
+    }
+
+    return firstRendered || (typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null);
+  }
+
+  function getDescendantBackground(view, element) {
+    if (!view || !element?.querySelectorAll) return null;
+
+    const doc = element.ownerDocument || null;
+    if (element === doc?.body || element === doc?.documentElement) return null;
+
+    const elementRect = element.getBoundingClientRect();
+    const { width: viewportWidth, height: viewportHeight } = getViewportSize(view, doc);
+    const maxWidth = Math.max(1, Math.min(elementRect.width || viewportWidth || 1, viewportWidth || elementRect.width || 1));
+    let best = null;
+    let inspected = 0;
+
+    const descendants = element.querySelectorAll('*');
+    for (const descendant of descendants) {
+      if (inspected >= 64) break;
+      if (!isRenderedElement(view, descendant)) continue;
+      inspected++;
+
+      const style = view.getComputedStyle(descendant);
+      const background = getStyleBackground(style);
+      if (!hasVisibleColor(background)) continue;
+
+      const rect = descendant.getBoundingClientRect();
+      const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth || rect.right) - Math.max(rect.left, 0));
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight || rect.bottom) - Math.max(rect.top, 0));
+      if (visibleWidth < 16 || visibleHeight < 8) continue;
+
+      const widthCoverage = visibleWidth / maxWidth;
+      if (widthCoverage < 0.35) continue;
+
+      const topDistance = Math.max(0, rect.top - Math.max(0, elementRect.top));
+      const score = (widthCoverage * 1000) + Math.min(visibleHeight, 96) - topDistance;
+
+      if (!best || score > best.score) {
+        best = { value: background, score };
+      }
+    }
+
+    return best?.value || null;
+  }
+
+  function addColorCandidate(candidates, value, priority = 'text') {
+    if (hasVisibleColor(value)) {
+      candidates.push({ value, priority });
+    }
+  }
+
+  function isLinkLikeElement(element) {
+    const role = element?.getAttribute?.('role');
+    return element?.localName === 'a'
+      || element?.localName === 'button'
+      || role === 'link'
+      || role === 'button'
+      || !!element?.closest?.('a,button,[role="link"],[role="button"]');
+  }
+
+  function collectForegroundCandidates(view, element, allowPageFallback = true) {
+    const candidates = [];
+    if (!view || !element) return candidates;
+
+    const doc = element.ownerDocument || null;
+    let current = element;
+    while (current) {
+      if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
+      const style = view.getComputedStyle(current);
+      addColorCandidate(candidates, style.color, 'text');
+      addColorCandidate(candidates, style.fill, 'text');
+      addColorCandidate(candidates, style.stroke, 'text');
+      current = current.parentElement;
+    }
+
+    const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
+    const linkCandidates = [];
+    const textCandidates = [];
+    let inspected = 0;
+    for (const descendant of descendants) {
+      if (inspected >= 32) break;
+      if (!isRenderedElement(view, descendant)) continue;
+
+      const style = view.getComputedStyle(descendant);
+      const linkLike = isLinkLikeElement(descendant);
+      const target = linkLike ? linkCandidates : textCandidates;
+      const priority = linkLike ? 'link' : 'text';
+      addColorCandidate(target, style.color, priority);
+      addColorCandidate(target, style.fill, priority);
+      addColorCandidate(target, style.stroke, priority);
+      inspected++;
+    }
+
+    return [
+      ...linkCandidates,
+      ...textCandidates,
+      ...candidates
+    ];
+  }
+
+  function getReadableForeground(bg, candidates = []) {
+    const bgRgb = parseCssRgb(bg);
+    if (!bgRgb) {
+      const fallback = candidates.find(candidate => hasVisibleColor(
+        typeof candidate === 'string' ? candidate : candidate?.value
+      ));
+      return typeof fallback === 'string' ? fallback : (fallback?.value || null);
+    }
+
+    const minimumReadableContrast = 3;
+    const preferredReadableContrast = 4.5;
+    const seen = new Set();
+    let best = null;
+
+    for (const candidate of candidates) {
+      const value = typeof candidate === 'string' ? candidate : candidate?.value;
+      const priority = typeof candidate === 'string' ? 'text' : candidate?.priority;
+      if (!hasVisibleColor(value)) continue;
+      const key = String(value).trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const rgb = parseCssRgb(value);
+      if (!rgb) continue;
+
+      const ratio = getContrastRatio(bgRgb, rgb);
+      if (priority === 'link' && ratio >= minimumReadableContrast) return value;
+      if (ratio >= preferredReadableContrast) return value;
+      if (ratio >= minimumReadableContrast && (!best || ratio > best.ratio)) {
+        best = { value, ratio };
+      }
+    }
+
+    if (best) return best.value;
+
+    const fallbacks = ['rgba(11, 13, 16, 0.92)', 'rgba(245, 247, 251, 0.96)'];
+    return fallbacks
+      .map(value => ({ value, ratio: getContrastRatio(bgRgb, parseCssRgb(value)) }))
+      .sort((a, b) => b.ratio - a.ratio)[0].value;
+  }
+
+  function getThemeFromElement(view, element, source = 'element', allowPageFallback = true) {
     if (!view || !element) return null;
 
     let fg = null;
     let bg = null;
     let current = element;
+    const doc = element.ownerDocument || null;
+    const elementBackground = getStyleBackground(view.getComputedStyle(element));
 
     while (current) {
+      if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
       const style = view.getComputedStyle(current);
       if (!fg && hasVisibleColor(style.color)) {
         fg = style.color;
       }
-      if (!bg && hasVisibleColor(style.backgroundColor)) {
-        bg = style.backgroundColor;
+      const background = getStyleBackground(style);
+      if (!bg && hasVisibleColor(background)) {
+        bg = background;
       }
       if (bg && fg) break;
       current = current.parentElement;
     }
 
+    const descendantBackground = getDescendantBackground(view, element);
+    if (descendantBackground && !hasVisibleColor(elementBackground)) {
+      bg = descendantBackground;
+    } else if (!bg) {
+      bg = descendantBackground;
+    }
+
     if (!bg) return null;
-    const bgRgb = parseCssRgb(bg);
+    const fgCandidates = [
+      ...collectForegroundCandidates(view, element, allowPageFallback),
+      { value: fg, priority: 'text' }
+    ];
     return {
       bg,
-      fg: fg || (bgRgb ? chooseForeground(bgRgb) : null),
+      fg: getReadableForeground(bg, fgCandidates),
       source
     };
   }
 
-  function getSemanticTheme(doc, view) {
+  function getDarkReaderTheme(doc, view) {
+    const root = doc?.documentElement;
+    if (!root || !view) return null;
+
+    const rootStyle = view.getComputedStyle(root);
+    const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+    const bg = rootStyle.getPropertyValue('--darkreader-neutral-background').trim()
+      || (bodyStyle?.getPropertyValue('--darkreader-neutral-background').trim() || '');
+    const fg = rootStyle.getPropertyValue('--darkreader-neutral-text').trim()
+      || (bodyStyle?.getPropertyValue('--darkreader-neutral-text').trim() || '');
+
+    if (!hasVisibleColor(bg)) return null;
+
+    const bgRgb = parseCssRgb(bg);
+    return {
+      bg,
+      fg: getReadableForeground(bg, [fg, bgRgb ? chooseForeground(bgRgb) : null]),
+      source: 'dark-reader'
+    };
+  }
+
+  function getThemeColorTheme(doc, view) {
     if (!doc || !view) return null;
 
-    return getThemeFromElement(view, doc.querySelector('nav'), 'nav')
-      || getThemeFromElement(view, doc.querySelector('header'), 'header');
+    const metas = doc.querySelectorAll?.('meta[name="theme-color" i]') || [];
+    for (const meta of metas) {
+      const media = meta.getAttribute?.('media') || '';
+      if (media) {
+        try {
+          if (!view.matchMedia(media).matches) continue;
+        } catch {}
+      }
+
+      const bg = meta.getAttribute?.('content') || '';
+      if (!hasVisibleColor(bg) || !cssSupports('color', bg)) continue;
+
+      const rootStyle = doc.documentElement ? view.getComputedStyle(doc.documentElement) : null;
+      const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+      const bgRgb = parseCssRgb(bg);
+      return {
+        bg,
+        fg: getReadableForeground(bg, [
+          bodyStyle?.color || null,
+          rootStyle?.color || null,
+          bgRgb ? chooseForeground(bgRgb) : null
+        ]),
+        source: 'theme-color'
+      };
+    }
+
+    return null;
   }
 
   function getBrowserPageThemeFromChrome(browser) {
@@ -266,54 +652,32 @@
       const root = doc?.documentElement;
       if (!doc || !view || !root) return null;
 
-      const visibleElement = typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null;
+      const visibleElement = getTopVisibleElement(view, doc);
+      const navElement = getFirstRenderedElement(view, doc, 'nav');
+      const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
       const candidates = {
-        header: describeElementTheme(view, doc.querySelector('header')),
-        nav: describeElementTheme(view, doc.querySelector('nav')),
+        header: describeElementTheme(view, headerElement),
+        nav: describeElementTheme(view, navElement),
         body: describeElementTheme(view, doc.body),
         visible: describeElementTheme(view, visibleElement),
         html: describeElementTheme(view, root)
       };
 
-      const semanticTheme = getSemanticTheme(doc, view);
-      if (semanticTheme?.bg) {
-        return {
-          ...semanticTheme,
-          bridge: 'chrome',
-          href: browser?.currentURI?.spec || '',
-          candidates
-        };
-      }
-
-      const bodyTheme = getThemeFromElement(view, doc.body, 'body');
-      if (bodyTheme?.bg) {
-        return {
-          ...bodyTheme,
-          bridge: 'chrome',
-          href: browser?.currentURI?.spec || '',
-          candidates
-        };
-      }
-
-      const visibleTheme = getThemeFromElement(view, visibleElement, 'visible');
-      if (visibleTheme?.bg) {
-        return {
-          ...visibleTheme,
-          bridge: 'chrome',
-          href: browser?.currentURI?.spec || '',
-          candidates
-        };
-      }
-
-      const rootTheme = getThemeFromElement(view, root, 'html');
-      if (!rootTheme?.bg) return null;
-
-      return {
-        ...rootTheme,
+      const href = browser?.currentURI?.spec || '';
+      const withMeta = (theme) => theme && ({
+        ...theme,
         bridge: 'chrome',
-        href: browser?.currentURI?.spec || '',
+        href,
         candidates
-      };
+      });
+
+      return withMeta(getThemeFromElement(view, navElement, 'nav', false))
+        || withMeta(getDarkReaderTheme(doc, view))
+        || withMeta(getThemeFromElement(view, headerElement, 'header'))
+        || withMeta(getThemeFromElement(view, visibleElement, 'visible'))
+        || withMeta(getThemeColorTheme(doc, view))
+        || withMeta(getThemeFromElement(view, doc.body, 'body'))
+        || withMeta(getThemeFromElement(view, root, 'html'));
     } catch (error) {
       if (DEBUG_VERBOSE) console.warn('[blended-addressbar:urlbar] Unable to read page theme', error);
       return null;
@@ -342,9 +706,87 @@
           const style = view.getComputedStyle(element);
           return {
             found: true,
-            bg: style.backgroundColor || null,
+            bg: getStyleBackground(style),
             fg: style.color || null
           };
+        };
+
+        const getViewportSize = (view, doc = null) => {
+          const root = doc?.documentElement || view?.document?.documentElement || null;
+          return {
+            width: view?.innerWidth || root?.clientWidth || 0,
+            height: view?.innerHeight || root?.clientHeight || 0
+          };
+        };
+
+        const rectIntersectsViewport = (view, rect) => {
+          if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+
+          const { width, height } = getViewportSize(view);
+          if (!width || !height) return true;
+
+          return rect.right > 0
+            && rect.bottom > 0
+            && rect.left < width
+            && rect.top < height;
+        };
+
+        const isRenderedElement = (view, element) => {
+          if (!view || !element) return false;
+          const style = view.getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+            return false;
+          }
+
+          const rects = element.getClientRects();
+          for (const rect of rects) {
+            if (rectIntersectsViewport(view, rect)) return true;
+          }
+
+          return false;
+        };
+
+        const getFirstRenderedElement = (view, doc, selector) => {
+          const elements = doc?.querySelectorAll?.(selector) || [];
+          for (const element of elements) {
+            if (isRenderedElement(view, element)) return element;
+          }
+
+          return doc?.querySelector?.(selector) || null;
+        };
+
+        const getTopVisibleElement = (view, doc) => {
+          if (!view || !doc) return null;
+
+          const { width, height } = getViewportSize(view, doc);
+          const xMid = Math.max(1, Math.floor((width || 2) / 2));
+          const xEnd = Math.max(1, (width || 2) - 2);
+          const yTop = Math.min(3, Math.max(0, (height || 4) - 1));
+          const yBand = Math.min(30, Math.max(0, (height || 31) - 1));
+          const points = [
+            [1, yTop],
+            [xMid, yTop],
+            [xEnd, yTop],
+            [1, yBand],
+            [xMid, yBand]
+          ];
+
+          let firstRendered = null;
+          for (const [x, y] of points) {
+            const elements = typeof doc.elementsFromPoint === 'function'
+              ? doc.elementsFromPoint(x, y)
+              : (typeof doc.elementFromPoint === 'function' ? [doc.elementFromPoint(x, y)] : []);
+
+            for (const element of elements) {
+              if (!isRenderedElement(view, element)) continue;
+              firstRendered ||= element;
+
+              const background = getStyleBackground(view.getComputedStyle(element));
+              if (hasVisibleColor(background)) return element;
+            }
+          }
+
+          return firstRendered || (typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null);
         };
 
         const hasVisibleColor = (input) => {
@@ -355,44 +797,294 @@
           return true;
         };
 
-        const parseCssRgb = (input) => {
-          if (!input) return null;
-          const match = String(input).trim().match(/^rgba?\\(([^)]+)\\)$/i);
-          if (!match) return null;
-          const parts = match[1].split(',').map((part) => part.trim());
-          if (parts.length < 3) return null;
-          const clamp = (value) => Math.max(0, Math.min(255, parseInt(value, 10)));
-          return { r: clamp(parts[0]), g: clamp(parts[1]), b: clamp(parts[2]) };
+        const extractCssColor = (input) => {
+          const value = String(input || '').trim();
+          if (!value || value === 'none') return null;
+
+          const candidates = value.match(/rgba?\\([^)]*\\)|hsla?\\([^)]*\\)|#[0-9a-f]{3,8}\\b/gi) || [];
+          return candidates.find((color) => hasVisibleColor(color)
+            && typeof CSS !== 'undefined'
+            && CSS.supports?.('color', color)) || null;
         };
 
-        const chooseForeground = ({ r, g, b }) => {
+        const getStyleBackground = (style) => {
+          if (!style) return null;
+          if (hasVisibleColor(style.backgroundColor)) return style.backgroundColor;
+          return extractCssColor(style.backgroundImage);
+        };
+
+        const getDescendantBackground = (view, element) => {
+          if (!view || !element?.querySelectorAll) return null;
+
+          const doc = element.ownerDocument || null;
+          if (element === doc?.body || element === doc?.documentElement) return null;
+
+          const elementRect = element.getBoundingClientRect();
+          const { width: viewportWidth, height: viewportHeight } = getViewportSize(view, doc);
+          const maxWidth = Math.max(1, Math.min(elementRect.width || viewportWidth || 1, viewportWidth || elementRect.width || 1));
+          let best = null;
+          let inspected = 0;
+
+          const descendants = element.querySelectorAll('*');
+          for (const descendant of descendants) {
+            if (inspected >= 64) break;
+            if (!isRenderedElement(view, descendant)) continue;
+            inspected++;
+
+            const style = view.getComputedStyle(descendant);
+            const background = getStyleBackground(style);
+            if (!hasVisibleColor(background)) continue;
+
+            const rect = descendant.getBoundingClientRect();
+            const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth || rect.right) - Math.max(rect.left, 0));
+            const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight || rect.bottom) - Math.max(rect.top, 0));
+            if (visibleWidth < 16 || visibleHeight < 8) continue;
+
+            const widthCoverage = visibleWidth / maxWidth;
+            if (widthCoverage < 0.35) continue;
+
+            const topDistance = Math.max(0, rect.top - Math.max(0, elementRect.top));
+            const score = (widthCoverage * 1000) + Math.min(visibleHeight, 96) - topDistance;
+
+            if (!best || score > best.score) {
+              best = { value: background, score };
+            }
+          }
+
+          return best?.value || null;
+        };
+
+        const getRelativeLuminance = ({ r, g, b }) => {
           const toLinear = (channel) => {
             const value = channel / 255;
             return value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
           };
-          const luminance = 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+          return 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+        };
+
+        const getContrastRatio = (colorA, colorB) => {
+          const lumA = getRelativeLuminance(colorA);
+          const lumB = getRelativeLuminance(colorB);
+          const lighter = Math.max(lumA, lumB);
+          const darker = Math.min(lumA, lumB);
+          return (lighter + 0.05) / (darker + 0.05);
+        };
+
+        const chooseForeground = ({ r, g, b }) => {
+          const luminance = getRelativeLuminance({ r, g, b });
           return luminance > 0.6 ? 'rgba(11, 13, 16, 0.92)' : 'rgba(245, 247, 251, 0.96)';
         };
 
-        const getThemeFromElement = (view, element, source = 'element') => {
+        const parseCssRgb = (input) => {
+          if (!input) return null;
+          const raw = String(input).trim();
+          const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
+          if (hex) {
+            const value = hex[1];
+            const expand = (part) => part.length === 1 ? part + part : part;
+            const r = parseInt(expand(value.length <= 4 ? value[0] : value.slice(0, 2)), 16);
+            const g = parseInt(expand(value.length <= 4 ? value[1] : value.slice(2, 4)), 16);
+            const b = parseInt(expand(value.length <= 4 ? value[2] : value.slice(4, 6)), 16);
+            return { r, g, b };
+          }
+
+          const match = raw.match(/^rgba?\\(([^)]+)\\)$/i);
+          if (!match) return null;
+          const parts = match[1].replace(/\\s*\\/\\s*[\\d.]+%?$/, '').split(/[,\\s]+/).filter(Boolean);
+          if (parts.length < 3) return null;
+          const readChannel = (part) => {
+            const value = parseFloat(part);
+            const scaled = String(part).trim().endsWith('%') ? value * 2.55 : value;
+            return Math.max(0, Math.min(255, Math.round(scaled)));
+          };
+          return { r: readChannel(parts[0]), g: readChannel(parts[1]), b: readChannel(parts[2]) };
+        };
+
+        const addColorCandidate = (candidates, value, priority = 'text') => {
+          if (hasVisibleColor(value)) candidates.push({ value, priority });
+        };
+
+        const isLinkLikeElement = (element) => {
+          const role = element?.getAttribute?.('role');
+          return element?.localName === 'a'
+            || element?.localName === 'button'
+            || role === 'link'
+            || role === 'button'
+            || !!element?.closest?.('a,button,[role="link"],[role="button"]');
+        };
+
+        const collectForegroundCandidates = (view, element, allowPageFallback = true) => {
+          const ancestorCandidates = [];
+          if (!view || !element) return ancestorCandidates;
+
+          const doc = element.ownerDocument || null;
+          let current = element;
+          while (current) {
+            if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
+            const style = view.getComputedStyle(current);
+            addColorCandidate(ancestorCandidates, style.color, 'text');
+            addColorCandidate(ancestorCandidates, style.fill, 'text');
+            addColorCandidate(ancestorCandidates, style.stroke, 'text');
+            current = current.parentElement;
+          }
+
+          const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
+          const linkCandidates = [];
+          const textCandidates = [];
+          let inspected = 0;
+          for (const descendant of descendants) {
+            if (inspected >= 32) break;
+            if (!isRenderedElement(view, descendant)) continue;
+
+            const style = view.getComputedStyle(descendant);
+            const linkLike = isLinkLikeElement(descendant);
+            const target = linkLike ? linkCandidates : textCandidates;
+            const priority = linkLike ? 'link' : 'text';
+            addColorCandidate(target, style.color, priority);
+            addColorCandidate(target, style.fill, priority);
+            addColorCandidate(target, style.stroke, priority);
+            inspected++;
+          }
+
+          return [
+            ...linkCandidates,
+            ...textCandidates,
+            ...ancestorCandidates
+          ];
+        };
+
+        const getReadableForeground = (bg, candidates = []) => {
+          const bgRgb = parseCssRgb(bg);
+          if (!bgRgb) {
+            const fallback = candidates.find((candidate) => hasVisibleColor(
+              typeof candidate === 'string' ? candidate : candidate?.value
+            ));
+            return typeof fallback === 'string' ? fallback : (fallback?.value || null);
+          }
+
+          const minimumReadableContrast = 3;
+          const preferredReadableContrast = 4.5;
+          const seen = new Set();
+          let best = null;
+
+          for (const candidate of candidates) {
+            const value = typeof candidate === 'string' ? candidate : candidate?.value;
+            const priority = typeof candidate === 'string' ? 'text' : candidate?.priority;
+            if (!hasVisibleColor(value)) continue;
+            const key = String(value).trim().toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            const rgb = parseCssRgb(value);
+            if (!rgb) continue;
+
+            const ratio = getContrastRatio(bgRgb, rgb);
+            if (priority === 'link' && ratio >= minimumReadableContrast) return value;
+            if (ratio >= preferredReadableContrast) return value;
+            if (ratio >= minimumReadableContrast && (!best || ratio > best.ratio)) {
+              best = { value, ratio };
+            }
+          }
+
+          if (best) return best.value;
+
+          const fallbacks = ['rgba(11, 13, 16, 0.92)', 'rgba(245, 247, 251, 0.96)'];
+          return fallbacks
+            .map((value) => ({ value, ratio: getContrastRatio(bgRgb, parseCssRgb(value)) }))
+            .sort((a, b) => b.ratio - a.ratio)[0].value;
+        };
+
+        const getThemeFromElement = (view, element, source = 'element', allowPageFallback = true) => {
           if (!view || !element) return null;
           let fg = null;
           let bg = null;
           let current = element;
+          const doc = element.ownerDocument || null;
+          const elementBackground = getStyleBackground(view.getComputedStyle(element));
           while (current) {
+            if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
             const style = view.getComputedStyle(current);
             if (!fg && hasVisibleColor(style.color)) fg = style.color;
-            if (!bg && hasVisibleColor(style.backgroundColor)) bg = style.backgroundColor;
+            const background = getStyleBackground(style);
+            if (!bg && hasVisibleColor(background)) bg = background;
             if (bg && fg) break;
             current = current.parentElement;
           }
+          const descendantBackground = getDescendantBackground(view, element);
+          if (descendantBackground && !hasVisibleColor(elementBackground)) {
+            bg = descendantBackground;
+          } else if (!bg) {
+            bg = descendantBackground;
+          }
           if (!bg) return null;
+          const fgCandidates = [
+            ...collectForegroundCandidates(view, element, allowPageFallback),
+            { value: fg, priority: 'text' }
+          ];
+          return {
+            bg,
+            fg: getReadableForeground(bg, fgCandidates),
+            source
+          };
+        };
+
+        const getDarkReaderTheme = (doc, view) => {
+          const root = doc?.documentElement;
+          if (!root || !view) return null;
+
+          const rootStyle = view.getComputedStyle(root);
+          const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+          const bg = rootStyle.getPropertyValue('--darkreader-neutral-background').trim()
+            || (bodyStyle?.getPropertyValue('--darkreader-neutral-background').trim() || '');
+          const fg = rootStyle.getPropertyValue('--darkreader-neutral-text').trim()
+            || (bodyStyle?.getPropertyValue('--darkreader-neutral-text').trim() || '');
+
+          if (!hasVisibleColor(bg)) return null;
+
           const bgRgb = parseCssRgb(bg);
           return {
             bg,
-            fg: fg || (bgRgb ? chooseForeground(bgRgb) : null),
-            source
+            fg: getReadableForeground(bg, [fg, bgRgb ? chooseForeground(bgRgb) : null]),
+            source: 'dark-reader'
           };
+        };
+
+        const getThemeColorTheme = (doc, view) => {
+          if (!doc || !view) return null;
+
+          const metas = doc.querySelectorAll?.('meta[name="theme-color" i]') || [];
+          for (const meta of metas) {
+            const media = meta.getAttribute?.('media') || '';
+            if (media) {
+              try {
+                if (!view.matchMedia(media).matches) continue;
+              } catch {}
+            }
+
+            const bg = meta.getAttribute?.('content') || '';
+            if (!hasVisibleColor(bg)
+              || typeof CSS === 'undefined'
+              || !CSS.supports?.('color', bg)) {
+              continue;
+            }
+
+            const rootStyle = doc.documentElement ? view.getComputedStyle(doc.documentElement) : null;
+            const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+            const bgRgb = parseCssRgb(bg);
+            return {
+              bg,
+              fg: getReadableForeground(bg, [
+                bodyStyle?.color || null,
+                rootStyle?.color || null,
+                bgRgb ? chooseForeground(bgRgb) : null
+              ]),
+              source: 'theme-color'
+            };
+          }
+
+          return null;
         };
 
         const withMeta = (theme, href, candidates) => theme && ({
@@ -413,20 +1105,24 @@
             return;
           }
 
-          const visibleElement = typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null;
+          const visibleElement = getTopVisibleElement(view, doc);
+          const navElement = getFirstRenderedElement(view, doc, 'nav');
+          const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
           const candidates = {
-            header: describeElementTheme(view, doc.querySelector('header')),
-            nav: describeElementTheme(view, doc.querySelector('nav')),
+            header: describeElementTheme(view, headerElement),
+            nav: describeElementTheme(view, navElement),
             body: describeElementTheme(view, doc.body),
             visible: describeElementTheme(view, visibleElement),
             html: describeElementTheme(view, root)
           };
 
           const href = content.location.href;
-          const theme = withMeta(getThemeFromElement(view, doc.querySelector('nav'), 'nav'), href, candidates)
-            || withMeta(getThemeFromElement(view, doc.querySelector('header'), 'header'), href, candidates)
-            || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
+          const theme = withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
+            || withMeta(getDarkReaderTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
             || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates)
+            || withMeta(getThemeColorTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
             || withMeta(getThemeFromElement(view, root, 'html'), href, candidates);
 
           send({ ok: true, theme, candidates, href });
@@ -490,7 +1186,7 @@
           error: 'message-manager-timeout',
           href: browser?.currentURI?.spec || ''
         });
-      }, 750);
+      }, themeBridgeTimeoutMs);
 
       try {
         messageManager.addMessageListener(themeMessageName, listener);
@@ -522,9 +1218,87 @@
           const style = view.getComputedStyle(element);
           return {
             found: true,
-            bg: style.backgroundColor || null,
+            bg: getStyleBackground(style),
             fg: style.color || null
           };
+        };
+
+        const getViewportSize = (view, doc = null) => {
+          const root = doc?.documentElement || view?.document?.documentElement || null;
+          return {
+            width: view?.innerWidth || root?.clientWidth || 0,
+            height: view?.innerHeight || root?.clientHeight || 0
+          };
+        };
+
+        const rectIntersectsViewport = (view, rect) => {
+          if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+
+          const { width, height } = getViewportSize(view);
+          if (!width || !height) return true;
+
+          return rect.right > 0
+            && rect.bottom > 0
+            && rect.left < width
+            && rect.top < height;
+        };
+
+        const isRenderedElement = (view, element) => {
+          if (!view || !element) return false;
+          const style = view.getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+            return false;
+          }
+
+          const rects = element.getClientRects();
+          for (const rect of rects) {
+            if (rectIntersectsViewport(view, rect)) return true;
+          }
+
+          return false;
+        };
+
+        const getFirstRenderedElement = (view, doc, selector) => {
+          const elements = doc?.querySelectorAll?.(selector) || [];
+          for (const element of elements) {
+            if (isRenderedElement(view, element)) return element;
+          }
+
+          return doc?.querySelector?.(selector) || null;
+        };
+
+        const getTopVisibleElement = (view, doc) => {
+          if (!view || !doc) return null;
+
+          const { width, height } = getViewportSize(view, doc);
+          const xMid = Math.max(1, Math.floor((width || 2) / 2));
+          const xEnd = Math.max(1, (width || 2) - 2);
+          const yTop = Math.min(3, Math.max(0, (height || 4) - 1));
+          const yBand = Math.min(30, Math.max(0, (height || 31) - 1));
+          const points = [
+            [1, yTop],
+            [xMid, yTop],
+            [xEnd, yTop],
+            [1, yBand],
+            [xMid, yBand]
+          ];
+
+          let firstRendered = null;
+          for (const [x, y] of points) {
+            const elements = typeof doc.elementsFromPoint === 'function'
+              ? doc.elementsFromPoint(x, y)
+              : (typeof doc.elementFromPoint === 'function' ? [doc.elementFromPoint(x, y)] : []);
+
+            for (const element of elements) {
+              if (!isRenderedElement(view, element)) continue;
+              firstRendered ||= element;
+
+              const background = getStyleBackground(view.getComputedStyle(element));
+              if (hasVisibleColor(background)) return element;
+            }
+          }
+
+          return firstRendered || (typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null);
         };
 
         const hasVisibleColor = (input) => {
@@ -535,51 +1309,302 @@
           return true;
         };
 
-        const parseCssRgb = (input) => {
-          if (!input) return null;
-          const match = String(input).trim().match(/^rgba?\(([^)]+)\)$/i);
-          if (!match) return null;
-          const parts = match[1].split(',').map((part) => part.trim());
-          if (parts.length < 3) return null;
-          const clamp = (value) => Math.max(0, Math.min(255, parseInt(value, 10)));
-          return { r: clamp(parts[0]), g: clamp(parts[1]), b: clamp(parts[2]) };
+        const extractCssColor = (input) => {
+          const value = String(input || '').trim();
+          if (!value || value === 'none') return null;
+
+          const candidates = value.match(/rgba?\([^)]*\)|hsla?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
+          return candidates.find((color) => hasVisibleColor(color)
+            && typeof CSS !== 'undefined'
+            && CSS.supports?.('color', color)) || null;
         };
 
-        const chooseForeground = ({ r, g, b }) => {
+        const getStyleBackground = (style) => {
+          if (!style) return null;
+          if (hasVisibleColor(style.backgroundColor)) return style.backgroundColor;
+          return extractCssColor(style.backgroundImage);
+        };
+
+        const getDescendantBackground = (view, element) => {
+          if (!view || !element?.querySelectorAll) return null;
+
+          const doc = element.ownerDocument || null;
+          if (element === doc?.body || element === doc?.documentElement) return null;
+
+          const elementRect = element.getBoundingClientRect();
+          const { width: viewportWidth, height: viewportHeight } = getViewportSize(view, doc);
+          const maxWidth = Math.max(1, Math.min(elementRect.width || viewportWidth || 1, viewportWidth || elementRect.width || 1));
+          let best = null;
+          let inspected = 0;
+
+          const descendants = element.querySelectorAll('*');
+          for (const descendant of descendants) {
+            if (inspected >= 64) break;
+            if (!isRenderedElement(view, descendant)) continue;
+            inspected++;
+
+            const style = view.getComputedStyle(descendant);
+            const background = getStyleBackground(style);
+            if (!hasVisibleColor(background)) continue;
+
+            const rect = descendant.getBoundingClientRect();
+            const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth || rect.right) - Math.max(rect.left, 0));
+            const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight || rect.bottom) - Math.max(rect.top, 0));
+            if (visibleWidth < 16 || visibleHeight < 8) continue;
+
+            const widthCoverage = visibleWidth / maxWidth;
+            if (widthCoverage < 0.35) continue;
+
+            const topDistance = Math.max(0, rect.top - Math.max(0, elementRect.top));
+            const score = (widthCoverage * 1000) + Math.min(visibleHeight, 96) - topDistance;
+
+            if (!best || score > best.score) {
+              best = { value: background, score };
+            }
+          }
+
+          return best?.value || null;
+        };
+
+        const getRelativeLuminance = ({ r, g, b }) => {
           const toLinear = (channel) => {
             const value = channel / 255;
             return value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
           };
-          const luminance = 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+          return 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+        };
+
+        const getContrastRatio = (colorA, colorB) => {
+          const lumA = getRelativeLuminance(colorA);
+          const lumB = getRelativeLuminance(colorB);
+          const lighter = Math.max(lumA, lumB);
+          const darker = Math.min(lumA, lumB);
+          return (lighter + 0.05) / (darker + 0.05);
+        };
+
+        const chooseForeground = ({ r, g, b }) => {
+          const luminance = getRelativeLuminance({ r, g, b });
           return luminance > 0.6 ? 'rgba(11, 13, 16, 0.92)' : 'rgba(245, 247, 251, 0.96)';
         };
 
-        const getThemeFromElement = (view, element, source = 'element') => {
+        const parseCssRgb = (input) => {
+          if (!input) return null;
+          const raw = String(input).trim();
+          const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
+          if (hex) {
+            const value = hex[1];
+            const expand = (part) => part.length === 1 ? part + part : part;
+            const r = parseInt(expand(value.length <= 4 ? value[0] : value.slice(0, 2)), 16);
+            const g = parseInt(expand(value.length <= 4 ? value[1] : value.slice(2, 4)), 16);
+            const b = parseInt(expand(value.length <= 4 ? value[2] : value.slice(4, 6)), 16);
+            return { r, g, b };
+          }
+
+          const match = raw.match(/^rgba?\(([^)]+)\)$/i);
+          if (!match) return null;
+          const parts = match[1].replace(/\s*\/\s*[\d.]+%?$/, '').split(/[,\s]+/).filter(Boolean);
+          if (parts.length < 3) return null;
+          const readChannel = (part) => {
+            const value = parseFloat(part);
+            const scaled = String(part).trim().endsWith('%') ? value * 2.55 : value;
+            return Math.max(0, Math.min(255, Math.round(scaled)));
+          };
+          return { r: readChannel(parts[0]), g: readChannel(parts[1]), b: readChannel(parts[2]) };
+        };
+
+        const addColorCandidate = (candidates, value, priority = 'text') => {
+          if (hasVisibleColor(value)) candidates.push({ value, priority });
+        };
+
+        const isLinkLikeElement = (element) => {
+          const role = element?.getAttribute?.('role');
+          return element?.localName === 'a'
+            || element?.localName === 'button'
+            || role === 'link'
+            || role === 'button'
+            || !!element?.closest?.('a,button,[role="link"],[role="button"]');
+        };
+
+        const collectForegroundCandidates = (view, element, allowPageFallback = true) => {
+          const ancestorCandidates = [];
+          if (!view || !element) return ancestorCandidates;
+
+          const doc = element.ownerDocument || null;
+          let current = element;
+          while (current) {
+            if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
+            const style = view.getComputedStyle(current);
+            addColorCandidate(ancestorCandidates, style.color, 'text');
+            addColorCandidate(ancestorCandidates, style.fill, 'text');
+            addColorCandidate(ancestorCandidates, style.stroke, 'text');
+            current = current.parentElement;
+          }
+
+          const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
+          const linkCandidates = [];
+          const textCandidates = [];
+          let inspected = 0;
+          for (const descendant of descendants) {
+            if (inspected >= 32) break;
+            if (!isRenderedElement(view, descendant)) continue;
+
+            const style = view.getComputedStyle(descendant);
+            const linkLike = isLinkLikeElement(descendant);
+            const target = linkLike ? linkCandidates : textCandidates;
+            const priority = linkLike ? 'link' : 'text';
+            addColorCandidate(target, style.color, priority);
+            addColorCandidate(target, style.fill, priority);
+            addColorCandidate(target, style.stroke, priority);
+            inspected++;
+          }
+
+          return [
+            ...linkCandidates,
+            ...textCandidates,
+            ...ancestorCandidates
+          ];
+        };
+
+        const getReadableForeground = (bg, candidates = []) => {
+          const bgRgb = parseCssRgb(bg);
+          if (!bgRgb) {
+            const fallback = candidates.find((candidate) => hasVisibleColor(
+              typeof candidate === 'string' ? candidate : candidate?.value
+            ));
+            return typeof fallback === 'string' ? fallback : (fallback?.value || null);
+          }
+
+          const minimumReadableContrast = 3;
+          const preferredReadableContrast = 4.5;
+          const seen = new Set();
+          let best = null;
+
+          for (const candidate of candidates) {
+            const value = typeof candidate === 'string' ? candidate : candidate?.value;
+            const priority = typeof candidate === 'string' ? 'text' : candidate?.priority;
+            if (!hasVisibleColor(value)) continue;
+            const key = String(value).trim().toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            const rgb = parseCssRgb(value);
+            if (!rgb) continue;
+
+            const ratio = getContrastRatio(bgRgb, rgb);
+            if (priority === 'link' && ratio >= minimumReadableContrast) return value;
+            if (ratio >= preferredReadableContrast) return value;
+            if (ratio >= minimumReadableContrast && (!best || ratio > best.ratio)) {
+              best = { value, ratio };
+            }
+          }
+
+          if (best) return best.value;
+
+          const fallbacks = ['rgba(11, 13, 16, 0.92)', 'rgba(245, 247, 251, 0.96)'];
+          return fallbacks
+            .map((value) => ({ value, ratio: getContrastRatio(bgRgb, parseCssRgb(value)) }))
+            .sort((a, b) => b.ratio - a.ratio)[0].value;
+        };
+
+        const getThemeFromElement = (view, element, source = 'element', allowPageFallback = true) => {
           if (!view || !element) return null;
           let fg = null;
           let bg = null;
           let current = element;
+          const doc = element.ownerDocument || null;
+          const elementBackground = getStyleBackground(view.getComputedStyle(element));
           while (current) {
+            if (!allowPageFallback && (current === doc?.body || current === doc?.documentElement)) break;
+
             const style = view.getComputedStyle(current);
             if (!fg && hasVisibleColor(style.color)) fg = style.color;
-            if (!bg && hasVisibleColor(style.backgroundColor)) bg = style.backgroundColor;
+            const background = getStyleBackground(style);
+            if (!bg && hasVisibleColor(background)) bg = background;
             if (bg && fg) break;
             current = current.parentElement;
           }
+          const descendantBackground = getDescendantBackground(view, element);
+          if (descendantBackground && !hasVisibleColor(elementBackground)) {
+            bg = descendantBackground;
+          } else if (!bg) {
+            bg = descendantBackground;
+          }
           if (!bg) return null;
-          const bgRgb = parseCssRgb(bg);
+          const fgCandidates = [
+            ...collectForegroundCandidates(view, element, allowPageFallback),
+            { value: fg, priority: 'text' }
+          ];
           return {
             bg,
-            fg: fg || (bgRgb ? chooseForeground(bgRgb) : null),
+            fg: getReadableForeground(bg, fgCandidates),
             source
           };
         };
 
-        const getSemanticTheme = (doc, view) => {
-          if (!doc || !view) return null;
-          return getThemeFromElement(view, doc.querySelector('nav'), 'nav')
-            || getThemeFromElement(view, doc.querySelector('header'), 'header');
+        const getDarkReaderTheme = (doc, view) => {
+          const root = doc?.documentElement;
+          if (!root || !view) return null;
+
+          const rootStyle = view.getComputedStyle(root);
+          const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+          const bg = rootStyle.getPropertyValue('--darkreader-neutral-background').trim()
+            || (bodyStyle?.getPropertyValue('--darkreader-neutral-background').trim() || '');
+          const fg = rootStyle.getPropertyValue('--darkreader-neutral-text').trim()
+            || (bodyStyle?.getPropertyValue('--darkreader-neutral-text').trim() || '');
+
+          if (!hasVisibleColor(bg)) return null;
+
+          const bgRgb = parseCssRgb(bg);
+          return {
+            bg,
+            fg: getReadableForeground(bg, [fg, bgRgb ? chooseForeground(bgRgb) : null]),
+            source: 'dark-reader'
+          };
         };
+
+        const getThemeColorTheme = (doc, view) => {
+          if (!doc || !view) return null;
+
+          const metas = doc.querySelectorAll?.('meta[name="theme-color" i]') || [];
+          for (const meta of metas) {
+            const media = meta.getAttribute?.('media') || '';
+            if (media) {
+              try {
+                if (!view.matchMedia(media).matches) continue;
+              } catch {}
+            }
+
+            const bg = meta.getAttribute?.('content') || '';
+            if (!hasVisibleColor(bg)
+              || typeof CSS === 'undefined'
+              || !CSS.supports?.('color', bg)) {
+              continue;
+            }
+
+            const rootStyle = doc.documentElement ? view.getComputedStyle(doc.documentElement) : null;
+            const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+            const bgRgb = parseCssRgb(bg);
+            return {
+              bg,
+              fg: getReadableForeground(bg, [
+                bodyStyle?.color || null,
+                rootStyle?.color || null,
+                bgRgb ? chooseForeground(bgRgb) : null
+              ]),
+              source: 'theme-color'
+            };
+          }
+
+          return null;
+        };
+
+        const withMeta = (theme, href, candidates) => theme && ({
+          ...theme,
+          bridge: 'content',
+          href,
+          candidates
+        });
 
         try {
           const doc = content.document;
@@ -587,54 +1612,25 @@
           const root = doc?.documentElement;
           if (!doc || !view || !root) return null;
 
-          const visibleElement = typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null;
+          const visibleElement = getTopVisibleElement(view, doc);
+          const navElement = getFirstRenderedElement(view, doc, 'nav');
+          const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
           const candidates = {
-            header: describeElementTheme(view, doc.querySelector('header')),
-            nav: describeElementTheme(view, doc.querySelector('nav')),
+            header: describeElementTheme(view, headerElement),
+            nav: describeElementTheme(view, navElement),
             body: describeElementTheme(view, doc.body),
             visible: describeElementTheme(view, visibleElement),
             html: describeElementTheme(view, root)
           };
 
-          const semanticTheme = getSemanticTheme(doc, view);
-          if (semanticTheme?.bg) {
-            return {
-              ...semanticTheme,
-              bridge: 'content',
-              href: content.location.href,
-              candidates
-            };
-          }
-
-          const bodyTheme = getThemeFromElement(view, doc.body, 'body');
-          if (bodyTheme?.bg) {
-            return {
-              ...bodyTheme,
-              bridge: 'content',
-              href: content.location.href,
-              candidates
-            };
-          }
-
-          const visibleTheme = getThemeFromElement(view, visibleElement, 'visible');
-          if (visibleTheme?.bg) {
-            return {
-              ...visibleTheme,
-              bridge: 'content',
-              href: content.location.href,
-              candidates
-            };
-          }
-
-          const rootTheme = getThemeFromElement(view, root, 'html');
-          if (!rootTheme?.bg) return null;
-
-          return {
-            ...rootTheme,
-            bridge: 'content',
-            href: content.location.href,
-            candidates
-          };
+          const href = content.location.href;
+          return withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
+            || withMeta(getDarkReaderTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
+            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates)
+            || withMeta(getThemeColorTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
+            || withMeta(getThemeFromElement(view, root, 'html'), href, candidates);
         } catch {
           return null;
         }
@@ -645,20 +1641,42 @@
     }
   }
 
-  async function getBrowserPageTheme(browser) {
-    const messageManagerTheme = await getBrowserPageThemeFromMessageManager(browser);
-    if (messageManagerTheme?.bg) return messageManagerTheme;
+  async function firstResolvedTheme(promises) {
+    if (!promises.length) return null;
 
-    const contentTheme = await getBrowserPageThemeFromContent(browser);
-    if (contentTheme?.bg) return contentTheme;
+    return await new Promise((resolve) => {
+      let pending = promises.length;
 
-    return getBrowserPageThemeFromChrome(browser);
+      const finishEmpty = () => {
+        pending--;
+        if (pending === 0) resolve(null);
+      };
+
+      for (const promise of promises) {
+        Promise.resolve(promise).then((theme) => {
+          if (theme?.bg) {
+            resolve(theme);
+          } else {
+            finishEmpty();
+          }
+        }).catch(() => {
+          finishEmpty();
+        });
+      }
+    });
   }
 
-  async function getDefaultHeaderCss(browser) {
-    const pageTheme = await getBrowserPageTheme(browser);
-    if (pageTheme?.bg) return pageTheme;
+  async function getBrowserPageTheme(browser) {
+    const chromeTheme = getBrowserPageThemeFromChrome(browser);
+    if (chromeTheme?.bg) return chromeTheme;
 
+    return firstResolvedTheme([
+      getBrowserPageThemeFromContent(browser),
+      getBrowserPageThemeFromMessageManager(browser)
+    ]);
+  }
+
+  function getToolbarFallbackTheme(browser) {
     const probe = chromeDoc.createElement('div');
     probe.style.position = 'fixed';
     probe.style.pointerEvents = 'none';
@@ -803,6 +1821,15 @@
   let lastCss = null;
   let lastLogAt = 0;
   let currentIntervalMs = samplingIntervalMs;
+  let scheduledThemeTimers = [];
+  let viewportThemeUpdateTimer = 0;
+  let viewportResizeObserver = null;
+  let loadingThemePollTimer = 0;
+  let loadingThemePollStartedAt = 0;
+  let loadingThemePollBrowser = null;
+  let loadingThemePollHref = '';
+  let activeThemeUpdateInFlight = false;
+  let pendingActiveThemeUpdateOptions = null;
 
   function stopSampling() {
     samplingActive = false;
@@ -828,11 +1855,8 @@
     samplingInFlight = false;
 
     const pageTheme = await getBrowserPageTheme(gBrowser?.selectedBrowser || null);
-    if ((pageTheme?.source === 'header' || pageTheme?.source === 'nav') && pageTheme.bg) {
-      if (pageTheme.bg !== lastCss) {
-        lastCss = pageTheme.bg;
-        applyTheme(pageTheme, 'semantic-priority');
-      }
+    if ((pageTheme?.source === 'dark-reader' || pageTheme?.source === 'header' || pageTheme?.source === 'nav') && pageTheme.bg) {
+      applyResolvedTheme(gBrowser?.selectedBrowser || null, pageTheme, 'semantic-priority');
       scheduleNext();
       return;
     }
@@ -842,6 +1866,7 @@
       if (css !== lastCss) {
         lastCss = css;
         const fg = chooseForeground(result.rgba);
+        lastThemeKey = `${css}|${fg}`;
         applyTheme({
           bg: css,
           fg,
@@ -862,13 +1887,40 @@
     scheduleNext();
   }
 
-  async function startSampling(browser = gBrowser?.selectedBrowser || null) {
+  async function startSampling(browser = gBrowser?.selectedBrowser || null, options = {}) {
+    const {
+      fastOnly = false,
+      reason = 'fallback',
+      skipToolbarFallback = false
+    } = options;
     stopSampling();
-    const fallback = await getDefaultHeaderCss(browser);
-    if (!browser || browser !== gBrowser?.selectedBrowser) {
-      return;
+
+    if (!browser) return;
+
+    const expectedHref = getBrowserHref(browser);
+    const cachedTheme = getCachedTheme(browser);
+    if (cachedTheme) {
+      applyResolvedTheme(browser, cachedTheme, 'cache', expectedHref);
     }
-    applyTheme(fallback, 'fallback');
+
+    const fastTheme = getBrowserPageThemeFromChrome(browser);
+    if (fastTheme?.bg) {
+      applyResolvedTheme(browser, fastTheme, reason === 'fallback' ? 'fast' : reason, expectedHref);
+    } else if (fastOnly) {
+      return;
+    } else if (!cachedTheme && !skipToolbarFallback) {
+      applyResolvedTheme(browser, getToolbarFallbackTheme(browser), 'toolbar-fallback', expectedHref);
+    }
+
+    if (!fastOnly) {
+      const pageTheme = await getBrowserPageTheme(browser);
+      if (pageTheme?.bg) {
+        applyResolvedTheme(browser, pageTheme, reason, expectedHref);
+      } else if (!skipToolbarFallback) {
+        applyResolvedTheme(browser, getToolbarFallbackTheme(browser), reason, expectedHref);
+      }
+    }
+
     if (!samplingEnabled) {
       if (DEBUG) console.info('[blended-addressbar:urlbar] Sampling disabled');
       return;
@@ -888,11 +1940,119 @@
     if (DEBUG) console.info('[blended-addressbar:urlbar] Post-load sampling');
   }
 
-  async function updateActive() {
+  async function updateActive(options = {}) {
     const browser = gBrowser?.selectedBrowser;
     if (!browser) return;
+
+    if (activeThemeUpdateInFlight) {
+      pendingActiveThemeUpdateOptions = options;
+      return;
+    }
+
+    activeThemeUpdateInFlight = true;
     if (DEBUG) console.info('[blended-addressbar:urlbar] Update active tab');
-    await startSampling(browser);
+    try {
+      await startSampling(browser, options);
+    } finally {
+      activeThemeUpdateInFlight = false;
+      if (pendingActiveThemeUpdateOptions) {
+        const nextOptions = pendingActiveThemeUpdateOptions;
+        pendingActiveThemeUpdateOptions = null;
+        setTimeout(() => {
+          void updateActive(nextOptions);
+        }, 0);
+      }
+    }
+  }
+
+  function stopLoadingThemePolling() {
+    if (loadingThemePollTimer) clearTimeout(loadingThemePollTimer);
+    loadingThemePollTimer = 0;
+    loadingThemePollStartedAt = 0;
+    loadingThemePollBrowser = null;
+    loadingThemePollHref = '';
+  }
+
+  function scheduleLoadingThemePollTick() {
+    if (!loadingThemePollBrowser || !loadingThemePollStartedAt) return;
+
+    const browser = loadingThemePollBrowser;
+    const elapsed = Date.now() - loadingThemePollStartedAt;
+    const active = gBrowser?.selectedBrowser || null;
+    if (browser !== active || getBrowserHref(browser) !== loadingThemePollHref || elapsed > loadingThemePollMaxMs) {
+      stopLoadingThemePolling();
+      return;
+    }
+
+    void updateActive({
+      reason: elapsed < loadingThemePollAggressiveWindowMs ? 'loading-poll-fast' : 'loading-poll',
+      skipToolbarFallback: true
+    }).finally(() => {
+      if (!loadingThemePollBrowser || getBrowserHref(browser) !== loadingThemePollHref) return;
+
+      const nextElapsed = Date.now() - loadingThemePollStartedAt;
+      const interval = nextElapsed < loadingThemePollAggressiveWindowMs
+        ? loadingThemePollFastIntervalMs
+        : loadingThemePollSlowIntervalMs;
+      loadingThemePollTimer = setTimeout(scheduleLoadingThemePollTick, interval);
+    });
+  }
+
+  function startLoadingThemePolling(browser = gBrowser?.selectedBrowser || null) {
+    stopLoadingThemePolling();
+    if (!browser) return;
+
+    loadingThemePollBrowser = browser;
+    loadingThemePollHref = getBrowserHref(browser);
+    loadingThemePollStartedAt = Date.now();
+    loadingThemePollTimer = setTimeout(scheduleLoadingThemePollTick, 60);
+  }
+
+  function clearScheduledThemeUpdates() {
+    for (const timer of scheduledThemeTimers) {
+      clearTimeout(timer);
+    }
+    scheduledThemeTimers = [];
+  }
+
+  function scheduleActiveUpdates(delays, options = {}, scheduleOptions = {}) {
+    if (scheduleOptions.replace) {
+      clearScheduledThemeUpdates();
+    }
+
+    for (const delay of delays) {
+      const timer = setTimeout(() => {
+        scheduledThemeTimers = scheduledThemeTimers.filter(item => item !== timer);
+        void updateActive(options);
+      }, delay);
+      scheduledThemeTimers.push(timer);
+    }
+  }
+
+  function scheduleViewportThemeUpdate() {
+    if (viewportThemeUpdateTimer) clearTimeout(viewportThemeUpdateTimer);
+
+    viewportThemeUpdateTimer = setTimeout(() => {
+      viewportThemeUpdateTimer = 0;
+      scheduleActiveUpdates(
+        viewportThemeUpdateDelays,
+        { reason: 'viewport-resize' },
+        { replace: true }
+      );
+    }, 80);
+  }
+
+  function observeViewportThemeTarget() {
+    try {
+      if (typeof ResizeObserver === 'undefined') return;
+
+      const target = gBrowser?.selectedBrowser || chromeDoc.getElementById('tabbrowser-tabpanels');
+      if (!target) return;
+
+      if (viewportResizeObserver) viewportResizeObserver.disconnect();
+      viewportResizeObserver = new ResizeObserver(scheduleViewportThemeUpdate);
+      viewportResizeObserver.observe(target);
+    } catch {}
   }
 
   function initWhenReady() {
@@ -905,8 +2065,22 @@
     observeLoadbarPrefs();
 
     gBrowser.tabContainer.addEventListener('TabSelect', () => {
-      void updateActive();
+      observeViewportThemeTarget();
+      void updateActive({ reason: 'tab-select' });
     });
+
+    try {
+      window.addEventListener('resize', scheduleViewportThemeUpdate);
+      if (typeof addUnloadListener === 'function') {
+        addUnloadListener(() => {
+          window.removeEventListener('resize', scheduleViewportThemeUpdate);
+          if (viewportThemeUpdateTimer) clearTimeout(viewportThemeUpdateTimer);
+          if (viewportResizeObserver) viewportResizeObserver.disconnect();
+          stopLoadingThemePolling();
+        });
+      }
+    } catch {}
+    observeViewportThemeTarget();
 
     const pl = {
       onLocationChange(browserArg, webProgress, req, location, flags) {
@@ -915,9 +2089,12 @@
           const isTop = webProgress && webProgress.isTopLevel;
           const matches = browserArg === active;
           if (isTop && matches) {
-            setTimeout(() => {
-              void updateActive();
-            }, 50);
+            startLoadingThemePolling(browserArg);
+            scheduleActiveUpdates(
+              earlyThemeUpdateDelays,
+              { fastOnly: true, reason: 'early-location' },
+              { replace: true }
+            );
           }
         } catch {}
       },
@@ -927,24 +2104,36 @@
           const isTop = webProgress && webProgress.isTopLevel;
           const matches = browserArg === active;
           if (!matches || !isTop) return;
-          const stopFlag = Ci && Ci.nsIWebProgressListener
-            ? Ci.nsIWebProgressListener.STATE_STOP
-            : 0x00000010;
+          const listener = Ci && Ci.nsIWebProgressListener
+            ? Ci.nsIWebProgressListener
+            : null;
+          const startFlag = listener ? listener.STATE_START : 0x00000001;
+          const stopFlag = listener ? listener.STATE_STOP : 0x00000010;
+          if (flags & startFlag) {
+            startLoadingThemePolling(browserArg);
+            scheduleActiveUpdates(
+              earlyThemeUpdateDelays,
+              { fastOnly: true, reason: 'early-load' },
+              { replace: true }
+            );
+          }
           if (flags & stopFlag) {
             if (samplingEnabled) {
               enterPostLoadSampling();
-            } else {
-              setTimeout(() => {
-                void updateActive();
-              }, 50);
             }
+            stopLoadingThemePolling();
+            scheduleActiveUpdates(
+              settledThemeUpdateDelays,
+              { reason: 'settled-load' },
+              { replace: true }
+            );
           }
         } catch {}
       }
     };
     try { gBrowser.addTabsProgressListener(pl); } catch {}
 
-    void updateActive();
+    void updateActive({ reason: 'init' });
   }
 
   initWhenReady();

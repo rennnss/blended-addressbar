@@ -43,6 +43,12 @@
     "defaultValue": "2px"
   },
   {
+    "property": "uc.loadbar.opacity",
+    "label": "Loader bar opacity (%)",
+    "type": "string",
+    "defaultValue": "85"
+  },
+  {
     "property": "uc.loadbar.centerbar",
     "label": "Center Bar with Fading animation",
     "type": "checkbox"
