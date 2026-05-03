@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name           Blended Addressbar
 // @description    Adaptive header color for Zen URL bar
-// @version        0.8.11
+// @version        0.9.0
 // ==/UserScript==
 
 (() => {
@@ -22,6 +22,12 @@
   const loadingThemePollSlowIntervalMs = 650;
   const loadingThemePollAggressiveWindowMs = 3500;
   const loadingThemePollMaxMs = 45000;
+  const loadingSamplingEnabled = true;
+  const loadingSamplingIntervalMs = 120;
+  const sampledColorMinAlpha = 0.08;
+  const fallbackThemeStableDelayMs = 350;
+  const immediateThemeConfidenceMin = 4;
+  const activeThemeRefreshIntervalMs = 2500;
   const themeBridgeTimeoutMs = 250;
   const themeMessageName = 'blended-addressbar:theme-response';
   const loadbarPrefBranch = 'uc.loadbar.';
@@ -34,6 +40,28 @@
   let themeRequestSeq = 0;
   let servicesModule = null;
   let lastThemeKey = null;
+  const themeApplyState = {
+    href: '',
+    applied: null,
+    pending: null,
+    pendingTimer: 0
+  };
+  let samplingActive = false;
+  let samplingTimer = 0;
+  let samplingInFlight = false;
+  let lastCss = null;
+  let lastLogAt = 0;
+  let currentIntervalMs = samplingIntervalMs;
+  let scheduledThemeTimers = [];
+  let viewportThemeUpdateTimer = 0;
+  let viewportResizeObserver = null;
+  let loadingThemePollTimer = 0;
+  let loadingThemePollStartedAt = 0;
+  let loadingThemePollBrowser = null;
+  let loadingThemePollHref = '';
+  let activeThemeUpdateInFlight = false;
+  let pendingActiveThemeUpdateOptions = null;
+  let activeThemeRefreshTimer = 0;
 
   const setVar = (value, foreground) => {
     chromeDoc.documentElement.style.setProperty('--zen-tab-header-background', value || 'transparent');
@@ -79,6 +107,78 @@
     return `${theme?.bg || ''}|${theme?.fg || ''}`;
   }
 
+  function getThemeSourceConfidence(themeOrSource) {
+    const source = typeof themeOrSource === 'string'
+      ? themeOrSource
+      : (themeOrSource?.source || '');
+    return {
+      'dark-reader': 5,
+      'theme-color': 5,
+      nav: 4,
+      header: 4,
+      body: 3,
+      html: 3,
+      'document-canvas': 3,
+      visible: 2,
+      sampler: 1,
+      'chrome-contrast-fallback': 1,
+      'toolbar-fallback': 0
+    }[source] ?? 0;
+  }
+
+  function clearPendingThemeCandidate() {
+    if (themeApplyState.pendingTimer) clearTimeout(themeApplyState.pendingTimer);
+    themeApplyState.pendingTimer = 0;
+    themeApplyState.pending = null;
+  }
+
+  function resetThemeArbitration(href = '') {
+    clearPendingThemeCandidate();
+    themeApplyState.href = href;
+    themeApplyState.applied = null;
+  }
+
+  function ensureThemeArbitrationHref(href) {
+    if (themeApplyState.href !== href) {
+      resetThemeArbitration(href);
+    }
+  }
+
+  function shouldApplyThemeCandidate(theme, options = {}) {
+    if (!theme?.bg) return { action: 'ignore', confidence: 0, key: '' };
+
+    const {
+      appliedConfidence = themeApplyState.applied?.confidence ?? -1,
+      loading = false,
+      now = Date.now(),
+      pendingKey = themeApplyState.pending?.key || '',
+      pendingSince = themeApplyState.pending?.since || 0,
+      stableDelay = fallbackThemeStableDelayMs
+    } = options;
+    const confidence = getThemeSourceConfidence(theme);
+    const key = `${getThemeKey(theme)}|${theme.source || ''}`;
+
+    if (!loading) {
+      return confidence >= appliedConfidence
+        ? { action: 'apply', confidence, key }
+        : { action: 'ignore', confidence, key };
+    }
+
+    if (appliedConfidence >= 0 && confidence <= appliedConfidence) {
+      return { action: 'ignore', confidence, key };
+    }
+
+    if (confidence >= immediateThemeConfidenceMin) {
+      return { action: 'apply', confidence, key };
+    }
+
+    if (pendingKey === key && pendingSince && now - pendingSince >= stableDelay) {
+      return { action: 'apply', confidence, key };
+    }
+
+    return { action: 'defer', confidence, key };
+  }
+
   function cacheTheme(browser, theme) {
     if (!browser || !theme?.bg) return;
     themeCache.set(browser, {
@@ -93,13 +193,25 @@
     return cached.theme?.bg ? cached.theme : null;
   }
 
-  function applyResolvedTheme(browser, theme, reason, expectedHref = null) {
-    if (!theme?.bg || !browser || browser !== gBrowser?.selectedBrowser) return false;
-    if (expectedHref && getBrowserHref(browser) !== expectedHref) return false;
+  function isLoadingThemeFor(browser) {
+    return !!browser
+      && browser === loadingThemePollBrowser
+      && !!loadingThemePollStartedAt
+      && getBrowserHref(browser) === loadingThemePollHref;
+  }
 
+  function applyThemeCandidateNow(browser, theme, reason, expectedHref, decision) {
     cacheTheme(browser, theme);
+    clearPendingThemeCandidate();
 
     const key = getThemeKey(theme);
+    themeApplyState.applied = {
+      confidence: decision.confidence,
+      href: getBrowserHref(browser),
+      key,
+      source: theme.source || ''
+    };
+
     if (key !== lastThemeKey) {
       lastThemeKey = key;
       lastCss = theme.bg;
@@ -107,6 +219,60 @@
     }
 
     return true;
+  }
+
+  function queueStableThemeCandidate(browser, theme, reason, expectedHref, decision) {
+    const href = getBrowserHref(browser);
+    const now = Date.now();
+    const pending = themeApplyState.pending;
+    const sameCandidate = pending?.href === href && pending.key === decision.key;
+    const since = sameCandidate ? pending.since : now;
+
+    if (themeApplyState.pendingTimer) clearTimeout(themeApplyState.pendingTimer);
+    themeApplyState.pending = {
+      confidence: decision.confidence,
+      expectedHref,
+      href,
+      key: decision.key,
+      reason,
+      since,
+      theme
+    };
+
+    const elapsed = now - since;
+    const remaining = Math.max(0, fallbackThemeStableDelayMs - elapsed);
+    themeApplyState.pendingTimer = setTimeout(() => {
+      const queued = themeApplyState.pending;
+      if (!queued || queued.key !== decision.key || queued.href !== getBrowserHref(browser)) return;
+      void applyResolvedTheme(browser, queued.theme, queued.reason, queued.expectedHref, {
+        loading: true,
+        now: Date.now()
+      });
+    }, remaining);
+  }
+
+  function applyResolvedTheme(browser, theme, reason, expectedHref = null, options = {}) {
+    if (!theme?.bg || !browser || browser !== gBrowser?.selectedBrowser) return false;
+    if (expectedHref && getBrowserHref(browser) !== expectedHref) return false;
+
+    const visibleTheme = hasVisibleColor(theme.bg)
+      ? theme
+      : getChromeContrastFallbackTheme(browser, 'chrome-contrast-fallback');
+    const href = getBrowserHref(browser);
+    ensureThemeArbitrationHref(href);
+
+    const decision = shouldApplyThemeCandidate(visibleTheme, {
+      loading: options.loading ?? isLoadingThemeFor(browser),
+      now: options.now ?? Date.now()
+    });
+
+    if (decision.action === 'ignore') return false;
+    if (decision.action === 'defer') {
+      queueStableThemeCandidate(browser, visibleTheme, reason, expectedHref, decision);
+      return false;
+    }
+
+    return applyThemeCandidateNow(browser, visibleTheme, reason, expectedHref, decision);
   }
 
   function getPrefs() {
@@ -273,6 +439,18 @@
   function parseCssRgb(input) {
     if (!input) return null;
     const raw = String(input).trim();
+    const perceptual = raw.match(/^ok(?:lab|lch)\(\s*(\d+(?:\.\d+)?%?)/i);
+    if (perceptual) {
+      const channel = perceptual[1];
+      const lightness = channel.endsWith('%')
+        ? parseFloat(channel) / 100
+        : parseFloat(channel);
+      if (Number.isFinite(lightness)) {
+        const value = Math.max(0, Math.min(255, Math.round(lightness * 255)));
+        return { r: value, g: value, b: value };
+      }
+    }
+
     const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
     if (hex) {
       const value = hex[1];
@@ -298,11 +476,32 @@
     return { r, g, b };
   }
 
+  function getCssColorAlpha(value) {
+    const match = String(value || '').trim().match(/^[a-z-]+\(([^)]+)\)$/i);
+    if (!match) return null;
+
+    const body = match[1].trim();
+    let alpha = null;
+    if (body.includes('/')) {
+      alpha = body.slice(body.lastIndexOf('/') + 1).trim();
+    } else {
+      const parts = body.split(',');
+      if (parts.length === 4) alpha = parts[3].trim();
+    }
+
+    if (alpha === null) return null;
+
+    const amount = parseFloat(alpha);
+    if (!Number.isFinite(amount)) return null;
+    return alpha.endsWith('%') ? amount / 100 : amount;
+  }
+
   function hasVisibleColor(input) {
     if (!input) return false;
     const value = String(input).trim().toLowerCase();
     if (!value || value === 'transparent') return false;
-    if (/^rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/i.test(value)) return false;
+    const alpha = getCssColorAlpha(value);
+    if (alpha !== null && alpha < sampledColorMinAlpha) return false;
     return true;
   }
 
@@ -310,7 +509,7 @@
     const value = String(input || '').trim();
     if (!value || value === 'none') return null;
 
-    const candidates = value.match(/rgba?\([^)]*\)|hsla?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
+    const candidates = value.match(/[a-z-]+\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
     return candidates.find(color => hasVisibleColor(color) && cssSupports('color', color)) || null;
   }
 
@@ -645,6 +844,47 @@
     return null;
   }
 
+  function getDocumentCanvasTheme(doc, view) {
+    const root = doc?.documentElement;
+    if (!doc || !view || !root) return null;
+
+    const rootStyle = view.getComputedStyle(root);
+    const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+    let canvasBg = '';
+    let canvasFg = '';
+    let probe = null;
+
+    try {
+      probe = doc.createElement('div');
+      probe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;pointer-events:none;background-color:Canvas;color:CanvasText;';
+      root.appendChild(probe);
+      const probeStyle = view.getComputedStyle(probe);
+      canvasBg = probeStyle.backgroundColor;
+      canvasFg = probeStyle.color;
+    } catch {
+    } finally {
+      try { probe?.remove?.(); } catch {}
+    }
+
+    const bg = [
+      bodyStyle ? getStyleBackground(bodyStyle) : null,
+      getStyleBackground(rootStyle),
+      canvasBg
+    ].find(hasVisibleColor);
+
+    if (!bg) return null;
+
+    return {
+      bg,
+      fg: getReadableForeground(bg, [
+        bodyStyle?.color || null,
+        rootStyle?.color || null,
+        canvasFg || null
+      ]),
+      source: 'document-canvas'
+    };
+  }
+
   function getBrowserPageThemeFromChrome(browser) {
     try {
       const doc = browser?.contentDocument;
@@ -674,10 +914,11 @@
       return withMeta(getThemeFromElement(view, navElement, 'nav', false))
         || withMeta(getDarkReaderTheme(doc, view))
         || withMeta(getThemeFromElement(view, headerElement, 'header'))
-        || withMeta(getThemeFromElement(view, visibleElement, 'visible'))
         || withMeta(getThemeColorTheme(doc, view))
         || withMeta(getThemeFromElement(view, doc.body, 'body'))
-        || withMeta(getThemeFromElement(view, root, 'html'));
+        || withMeta(getThemeFromElement(view, root, 'html'))
+        || withMeta(getDocumentCanvasTheme(doc, view))
+        || withMeta(getThemeFromElement(view, visibleElement, 'visible'));
     } catch (error) {
       if (DEBUG_VERBOSE) console.warn('[blended-addressbar:urlbar] Unable to read page theme', error);
       return null;
@@ -789,29 +1030,50 @@
           return firstRendered || (typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null);
         };
 
-        const hasVisibleColor = (input) => {
+        const getCssColorAlpha = (value) => {
+          const match = String(value || '').trim().match(/^[a-z-]+\\(([^)]+)\\)$/i);
+          if (!match) return null;
+
+          const body = match[1].trim();
+          let alpha = null;
+          if (body.includes('/')) {
+            alpha = body.slice(body.lastIndexOf('/') + 1).trim();
+          } else {
+            const parts = body.split(',');
+            if (parts.length === 4) alpha = parts[3].trim();
+          }
+
+          if (alpha === null) return null;
+
+          const amount = parseFloat(alpha);
+          if (!Number.isFinite(amount)) return null;
+          return alpha.endsWith('%') ? amount / 100 : amount;
+        };
+
+        function hasVisibleColor(input) {
           if (!input) return false;
           const value = String(input).trim().toLowerCase();
           if (!value || value === 'transparent') return false;
-          if (/^rgba\\([^)]*,\\s*0(?:\\.0+)?\\s*\\)$/i.test(value)) return false;
+          const alpha = getCssColorAlpha(value);
+          if (alpha !== null && alpha < ${sampledColorMinAlpha}) return false;
           return true;
-        };
+        }
 
         const extractCssColor = (input) => {
           const value = String(input || '').trim();
           if (!value || value === 'none') return null;
 
-          const candidates = value.match(/rgba?\\([^)]*\\)|hsla?\\([^)]*\\)|#[0-9a-f]{3,8}\\b/gi) || [];
+          const candidates = value.match(/[a-z-]+\\([^)]*\\)|#[0-9a-f]{3,8}\\b/gi) || [];
           return candidates.find((color) => hasVisibleColor(color)
             && typeof CSS !== 'undefined'
             && CSS.supports?.('color', color)) || null;
         };
 
-        const getStyleBackground = (style) => {
+        function getStyleBackground(style) {
           if (!style) return null;
           if (hasVisibleColor(style.backgroundColor)) return style.backgroundColor;
           return extractCssColor(style.backgroundImage);
-        };
+        }
 
         const getDescendantBackground = (view, element) => {
           if (!view || !element?.querySelectorAll) return null;
@@ -878,6 +1140,18 @@
         const parseCssRgb = (input) => {
           if (!input) return null;
           const raw = String(input).trim();
+          const perceptual = raw.match(/^ok(?:lab|lch)\\(\\s*(\\d+(?:\\.\\d+)?%?)/i);
+          if (perceptual) {
+            const channel = perceptual[1];
+            const lightness = channel.endsWith('%')
+              ? parseFloat(channel) / 100
+              : parseFloat(channel);
+            if (Number.isFinite(lightness)) {
+              const value = Math.max(0, Math.min(255, Math.round(lightness * 255)));
+              return { r: value, g: value, b: value };
+            }
+          }
+
           const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
           if (hex) {
             const value = hex[1];
@@ -1087,6 +1361,47 @@
           return null;
         };
 
+        const getDocumentCanvasTheme = (doc, view) => {
+          const root = doc?.documentElement;
+          if (!doc || !view || !root) return null;
+
+          const rootStyle = view.getComputedStyle(root);
+          const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+          let canvasBg = '';
+          let canvasFg = '';
+          let probe = null;
+
+          try {
+            probe = doc.createElement('div');
+            probe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;pointer-events:none;background-color:Canvas;color:CanvasText;';
+            root.appendChild(probe);
+            const probeStyle = view.getComputedStyle(probe);
+            canvasBg = probeStyle.backgroundColor;
+            canvasFg = probeStyle.color;
+          } catch {
+          } finally {
+            try { probe?.remove?.(); } catch {}
+          }
+
+          const bg = [
+            bodyStyle ? getStyleBackground(bodyStyle) : null,
+            getStyleBackground(rootStyle),
+            canvasBg
+          ].find(hasVisibleColor);
+
+          if (!bg) return null;
+
+          return {
+            bg,
+            fg: getReadableForeground(bg, [
+              bodyStyle?.color || null,
+              rootStyle?.color || null,
+              canvasFg || null
+            ]),
+            source: 'document-canvas'
+          };
+        };
+
         const withMeta = (theme, href, candidates) => theme && ({
           ...theme,
           bridge: 'message-manager',
@@ -1120,10 +1435,11 @@
           const theme = withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
             || withMeta(getDarkReaderTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
-            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates)
             || withMeta(getThemeColorTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
-            || withMeta(getThemeFromElement(view, root, 'html'), href, candidates);
+            || withMeta(getThemeFromElement(view, root, 'html'), href, candidates)
+            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates);
 
           send({ ok: true, theme, candidates, href });
         } catch (error) {
@@ -1153,6 +1469,8 @@
 
     return await new Promise((resolve) => {
       let settled = false;
+      let listener = null;
+      let timeoutId = 0;
 
       const cleanup = () => {
         try {
@@ -1171,7 +1489,7 @@
         resolve(theme);
       };
 
-      const listener = {
+      listener = {
         receiveMessage(message) {
           const data = message?.data;
           if (!data || data.requestId !== requestId) return;
@@ -1179,7 +1497,7 @@
         }
       };
 
-      const timeoutId = setTimeout(() => {
+      timeoutId = setTimeout(() => {
         finish(null, {
           requestId,
           ok: false,
@@ -1301,29 +1619,50 @@
           return firstRendered || (typeof doc.elementFromPoint === 'function' ? doc.elementFromPoint(1, 3) : null);
         };
 
-        const hasVisibleColor = (input) => {
+        const getCssColorAlpha = (value) => {
+          const match = String(value || '').trim().match(/^[a-z-]+\(([^)]+)\)$/i);
+          if (!match) return null;
+
+          const body = match[1].trim();
+          let alpha = null;
+          if (body.includes('/')) {
+            alpha = body.slice(body.lastIndexOf('/') + 1).trim();
+          } else {
+            const parts = body.split(',');
+            if (parts.length === 4) alpha = parts[3].trim();
+          }
+
+          if (alpha === null) return null;
+
+          const amount = parseFloat(alpha);
+          if (!Number.isFinite(amount)) return null;
+          return alpha.endsWith('%') ? amount / 100 : amount;
+        };
+
+        function hasVisibleColor(input) {
           if (!input) return false;
           const value = String(input).trim().toLowerCase();
           if (!value || value === 'transparent') return false;
-          if (/^rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/i.test(value)) return false;
+          const alpha = getCssColorAlpha(value);
+          if (alpha !== null && alpha < 0.08) return false;
           return true;
-        };
+        }
 
         const extractCssColor = (input) => {
           const value = String(input || '').trim();
           if (!value || value === 'none') return null;
 
-          const candidates = value.match(/rgba?\([^)]*\)|hsla?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
+          const candidates = value.match(/[a-z-]+\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
           return candidates.find((color) => hasVisibleColor(color)
             && typeof CSS !== 'undefined'
             && CSS.supports?.('color', color)) || null;
         };
 
-        const getStyleBackground = (style) => {
+        function getStyleBackground(style) {
           if (!style) return null;
           if (hasVisibleColor(style.backgroundColor)) return style.backgroundColor;
           return extractCssColor(style.backgroundImage);
-        };
+        }
 
         const getDescendantBackground = (view, element) => {
           if (!view || !element?.querySelectorAll) return null;
@@ -1390,6 +1729,18 @@
         const parseCssRgb = (input) => {
           if (!input) return null;
           const raw = String(input).trim();
+          const perceptual = raw.match(/^ok(?:lab|lch)\(\s*(\d+(?:\.\d+)?%?)/i);
+          if (perceptual) {
+            const channel = perceptual[1];
+            const lightness = channel.endsWith('%')
+              ? parseFloat(channel) / 100
+              : parseFloat(channel);
+            if (Number.isFinite(lightness)) {
+              const value = Math.max(0, Math.min(255, Math.round(lightness * 255)));
+              return { r: value, g: value, b: value };
+            }
+          }
+
           const hex = raw.match(/^#([0-9a-f]{3,8})$/i);
           if (hex) {
             const value = hex[1];
@@ -1599,6 +1950,47 @@
           return null;
         };
 
+        const getDocumentCanvasTheme = (doc, view) => {
+          const root = doc?.documentElement;
+          if (!doc || !view || !root) return null;
+
+          const rootStyle = view.getComputedStyle(root);
+          const bodyStyle = doc.body ? view.getComputedStyle(doc.body) : null;
+          let canvasBg = '';
+          let canvasFg = '';
+          let probe = null;
+
+          try {
+            probe = doc.createElement('div');
+            probe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;pointer-events:none;background-color:Canvas;color:CanvasText;';
+            root.appendChild(probe);
+            const probeStyle = view.getComputedStyle(probe);
+            canvasBg = probeStyle.backgroundColor;
+            canvasFg = probeStyle.color;
+          } catch {
+          } finally {
+            try { probe?.remove?.(); } catch {}
+          }
+
+          const bg = [
+            bodyStyle ? getStyleBackground(bodyStyle) : null,
+            getStyleBackground(rootStyle),
+            canvasBg
+          ].find(hasVisibleColor);
+
+          if (!bg) return null;
+
+          return {
+            bg,
+            fg: getReadableForeground(bg, [
+              bodyStyle?.color || null,
+              rootStyle?.color || null,
+              canvasFg || null
+            ]),
+            source: 'document-canvas'
+          };
+        };
+
         const withMeta = (theme, href, candidates) => theme && ({
           ...theme,
           bridge: 'content',
@@ -1627,10 +2019,11 @@
           return withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
             || withMeta(getDarkReaderTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
-            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates)
             || withMeta(getThemeColorTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
-            || withMeta(getThemeFromElement(view, root, 'html'), href, candidates);
+            || withMeta(getThemeFromElement(view, root, 'html'), href, candidates)
+            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates)
+            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates);
         } catch {
           return null;
         }
@@ -1677,6 +2070,83 @@
   }
 
   function getToolbarFallbackTheme(browser) {
+    return {
+      ...getChromeContrastFallbackTheme(browser, 'chrome-contrast-fallback'),
+      bridge: 'toolbar-fallback',
+      source: 'toolbar-fallback'
+    };
+  }
+
+  function rgbaToCss(color) {
+    return `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a.toFixed(3)})`;
+  }
+
+  function rgbToCss({ r, g, b }) {
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+
+  function mixRgb(color, target, amount) {
+    const mix = (channel, targetChannel) => Math.round(channel + ((targetChannel - channel) * amount));
+    return {
+      r: Math.max(0, Math.min(255, mix(color.r, target.r))),
+      g: Math.max(0, Math.min(255, mix(color.g, target.g))),
+      b: Math.max(0, Math.min(255, mix(color.b, target.b)))
+    };
+  }
+
+  function getContrastingChromeBackground(baseColor) {
+    const luminance = getRelativeLuminance(baseColor);
+    const target = luminance > 0.5
+      ? { r: 0, g: 0, b: 0 }
+      : { r: 255, g: 255, b: 255 };
+    return mixRgb(baseColor, target, 0.1);
+  }
+
+  function getSampledTheme(result, browser = gBrowser?.selectedBrowser || null) {
+    if (!result?.rgba || result.rgba.a < sampledColorMinAlpha) return null;
+
+    const css = rgbaToCss(result.rgba);
+    if (!hasVisibleColor(css)) return null;
+
+    return {
+      bg: css,
+      fg: chooseForeground(result.rgba),
+      bridge: 'sampler',
+      source: 'sampler',
+      href: browser?.currentURI?.spec || ''
+    };
+  }
+
+  function getAverageSampleLineColor(data) {
+    if (!data?.length) return null;
+
+    let alphaTotal = 0;
+    let redTotal = 0;
+    let greenTotal = 0;
+    let blueTotal = 0;
+
+    for (let i = 0; i < data.length; i += 4) {
+      const alpha = data[i + 3] / 255;
+      if (alpha <= 0) continue;
+
+      alphaTotal += alpha;
+      redTotal += data[i] * alpha;
+      greenTotal += data[i + 1] * alpha;
+      blueTotal += data[i + 2] * alpha;
+    }
+
+    if (alphaTotal <= 0) return null;
+
+    const pixels = data.length / 4;
+    return {
+      r: Math.round(redTotal / alphaTotal),
+      g: Math.round(greenTotal / alphaTotal),
+      b: Math.round(blueTotal / alphaTotal),
+      a: Math.max(0, Math.min(1, alphaTotal / pixels))
+    };
+  }
+
+  function getChromeContrastFallbackTheme(browser, reason = 'chrome-contrast-fallback') {
     const probe = chromeDoc.createElement('div');
     probe.style.position = 'fixed';
     probe.style.pointerEvents = 'none';
@@ -1689,29 +2159,26 @@
     probe.remove();
 
     const rootBg = getComputedStyle(chromeDoc.documentElement).backgroundColor;
-    const bg = toolbarBg && toolbarBg !== 'transparent' ? toolbarBg : rootBg;
-    const fg = hasVisibleColor(toolbarFg)
-      ? toolbarFg
-      : (() => {
-          const rgb = parseCssRgb(bg);
-          return rgb ? chooseForeground(rgb) : null;
-        })();
+    const baseBg = [toolbarBg, rootBg, 'Canvas'].find(hasVisibleColor) || 'Canvas';
+    const baseRgb = parseCssRgb(baseBg) || { r: 255, g: 255, b: 255 };
+    const bg = rgbToCss(getContrastingChromeBackground(baseRgb));
+    const fg = getReadableForeground(bg, [
+      { value: toolbarFg, priority: 'text' },
+      chooseForeground(parseCssRgb(bg) || baseRgb)
+    ]);
+
     return {
-      bg: bg || 'transparent',
+      bg,
       fg,
-      bridge: 'toolbar-fallback',
-      source: 'toolbar-fallback',
+      bridge: 'chrome',
+      source: reason,
       href: browser?.currentURI?.spec || ''
     };
   }
 
-  function rgbaToCss(color) {
-    return `rgba(${color.r}, ${color.g}, ${color.b}, ${color.a.toFixed(3)})`;
-  }
-
   const sampleCanvas = chromeDoc.createElement('canvas');
-  sampleCanvas.width = 2;
-  sampleCanvas.height = 2;
+  sampleCanvas.width = 1;
+  sampleCanvas.height = 1;
   const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
 
   let samplerOverlay = null;
@@ -1755,8 +2222,10 @@
       return null;
     }
 
-    const contentX = 1;
-    const contentY = 3;
+    const sampleWidth = Math.max(1, Math.floor(rect.width));
+    const sampleHeight = 1;
+    const contentX = 0;
+    const contentY = 0;
     const x = Math.max(0, Math.floor(rect.left + contentX));
     const y = Math.max(0, Math.floor(rect.top + contentY));
     updateSamplerOverlay(x, y);
@@ -1768,6 +2237,9 @@
 
     const windowUtils = window.windowUtils;
     try {
+      if (sampleCanvas.width !== sampleWidth) sampleCanvas.width = sampleWidth;
+      if (sampleCanvas.height !== sampleHeight) sampleCanvas.height = sampleHeight;
+
       const wg = browser?.browsingContext?.currentWindowGlobal;
       if (wg && typeof wg.drawSnapshot === 'function') {
         const bc = browser?.browsingContext || null;
@@ -1777,19 +2249,19 @@
         const scrollY = typeof bc?.top?.scrollY === 'number'
           ? bc.top.scrollY
           : (typeof bc?.scrollY === 'number' ? bc.scrollY : 0);
-        const rect = new DOMRect(contentX + scrollX, contentY + scrollY, 1, 1);
+        const rect = new DOMRect(contentX + scrollX, contentY + scrollY, sampleWidth, sampleHeight);
         const bitmap = await wg.drawSnapshot(rect, 1, 'transparent');
-        sampleCtx.clearRect(0, 0, 1, 1);
+        sampleCtx.clearRect(0, 0, sampleWidth, sampleHeight);
         sampleCtx.drawImage(bitmap, 0, 0);
         if (bitmap && typeof bitmap.close === 'function') bitmap.close();
       } else if (windowUtils && typeof windowUtils.drawSnapshot === 'function') {
-        const bitmap = await windowUtils.drawSnapshot({ x, y, width: 1, height: 1 }, 1, 'transparent');
-        sampleCtx.clearRect(0, 0, 1, 1);
+        const bitmap = await windowUtils.drawSnapshot({ x, y, width: sampleWidth, height: sampleHeight }, 1, 'transparent');
+        sampleCtx.clearRect(0, 0, sampleWidth, sampleHeight);
         sampleCtx.drawImage(bitmap, 0, 0);
         if (bitmap && typeof bitmap.close === 'function') bitmap.close();
       } else if (typeof sampleCtx.drawWindow === 'function') {
-        sampleCtx.clearRect(0, 0, 1, 1);
-        sampleCtx.drawWindow(window, x, y, 1, 1, 'transparent');
+        sampleCtx.clearRect(0, 0, sampleWidth, sampleHeight);
+        sampleCtx.drawWindow(window, x, y, sampleWidth, sampleHeight, 'transparent');
       } else {
         if (DEBUG) console.warn('[blended-addressbar:urlbar] No snapshot API available');
         return null;
@@ -1799,14 +2271,18 @@
       return null;
     }
 
-    const data = sampleCtx.getImageData(0, 0, 1, 1).data;
+    const data = sampleCtx.getImageData(0, 0, sampleWidth, sampleHeight).data;
+    const rgba = getAverageSampleLineColor(data);
+    if (!rgba) return null;
+
     return {
-      rgba: { r: data[0], g: data[1], b: data[2], a: data[3] / 255 },
+      rgba,
       meta: {
         x,
         y,
         rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
         method: browser?.browsingContext?.currentWindowGlobal?.drawSnapshot ? 'content-snapshot' : 'chrome-snapshot',
+        sample: { width: sampleWidth, height: sampleHeight },
         scroll: {
           x: browser?.browsingContext?.top?.scrollX,
           y: browser?.browsingContext?.top?.scrollY
@@ -1814,22 +2290,6 @@
       }
     };
   }
-
-  let samplingActive = false;
-  let samplingTimer = 0;
-  let samplingInFlight = false;
-  let lastCss = null;
-  let lastLogAt = 0;
-  let currentIntervalMs = samplingIntervalMs;
-  let scheduledThemeTimers = [];
-  let viewportThemeUpdateTimer = 0;
-  let viewportResizeObserver = null;
-  let loadingThemePollTimer = 0;
-  let loadingThemePollStartedAt = 0;
-  let loadingThemePollBrowser = null;
-  let loadingThemePollHref = '';
-  let activeThemeUpdateInFlight = false;
-  let pendingActiveThemeUpdateOptions = null;
 
   function stopSampling() {
     samplingActive = false;
@@ -1850,36 +2310,40 @@
       return;
     }
 
-    samplingInFlight = true;
-    const result = await sampleTabPanelsPixel();
-    samplingInFlight = false;
+    const browser = gBrowser?.selectedBrowser || null;
+    const expectedHref = getBrowserHref(browser);
 
-    const pageTheme = await getBrowserPageTheme(gBrowser?.selectedBrowser || null);
+    samplingInFlight = true;
+    const pageTheme = await getBrowserPageTheme(browser);
     if ((pageTheme?.source === 'dark-reader' || pageTheme?.source === 'header' || pageTheme?.source === 'nav') && pageTheme.bg) {
-      applyResolvedTheme(gBrowser?.selectedBrowser || null, pageTheme, 'semantic-priority');
+      samplingInFlight = false;
+      applyResolvedTheme(browser, pageTheme, 'semantic-priority', expectedHref);
       scheduleNext();
       return;
     }
 
-    if (result && result.rgba) {
-      const css = rgbaToCss(result.rgba);
-      if (css !== lastCss) {
-        lastCss = css;
-        const fg = chooseForeground(result.rgba);
-        lastThemeKey = `${css}|${fg}`;
-        applyTheme({
-          bg: css,
-          fg,
-          bridge: 'sampler',
-          source: 'sampler',
-          href: gBrowser?.selectedBrowser?.currentURI?.spec || ''
-        }, 'sampler');
-        if (DEBUG) {
-          const now = Date.now();
-          if (now - lastLogAt > 1000) {
-            lastLogAt = now;
-            console.info('[blended-addressbar:urlbar] Apply', css, { ...result.meta, fg });
-          }
+    if (pageTheme?.bg) {
+      samplingInFlight = false;
+      applyResolvedTheme(browser, pageTheme, 'sampler-fallback', expectedHref);
+      scheduleNext();
+      return;
+    }
+
+    const result = await sampleTabPanelsPixel();
+    samplingInFlight = false;
+
+    const sampledTheme = getSampledTheme(result, browser);
+    if (sampledTheme?.bg) {
+      applyResolvedTheme(browser, sampledTheme, 'sampler', expectedHref);
+      if (DEBUG) {
+        const now = Date.now();
+        if (now - lastLogAt > 1000) {
+          lastLogAt = now;
+          console.info('[blended-addressbar:urlbar] Apply sampled theme', {
+            ...result.meta,
+            bg: sampledTheme.bg,
+            fg: sampledTheme.fg
+          });
         }
       }
     }
@@ -1889,8 +2353,10 @@
 
   async function startSampling(browser = gBrowser?.selectedBrowser || null, options = {}) {
     const {
+      enableSampler = false,
       fastOnly = false,
       reason = 'fallback',
+      samplingInterval = samplingIntervalMs,
       skipToolbarFallback = false
     } = options;
     stopSampling();
@@ -1921,12 +2387,12 @@
       }
     }
 
-    if (!samplingEnabled) {
+    if (!samplingEnabled && !enableSampler) {
       if (DEBUG) console.info('[blended-addressbar:urlbar] Sampling disabled');
       return;
     }
     samplingActive = true;
-    currentIntervalMs = samplingIntervalMs;
+    currentIntervalMs = samplingInterval;
     if (DEBUG) console.info('[blended-addressbar:urlbar] Start sampling');
     sampleTick();
   }
@@ -1971,6 +2437,7 @@
     loadingThemePollStartedAt = 0;
     loadingThemePollBrowser = null;
     loadingThemePollHref = '';
+    if (!samplingEnabled) stopSampling();
   }
 
   function scheduleLoadingThemePollTick() {
@@ -1985,7 +2452,9 @@
     }
 
     void updateActive({
+      enableSampler: loadingSamplingEnabled,
       reason: elapsed < loadingThemePollAggressiveWindowMs ? 'loading-poll-fast' : 'loading-poll',
+      samplingInterval: loadingSamplingIntervalMs,
       skipToolbarFallback: true
     }).finally(() => {
       if (!loadingThemePollBrowser || getBrowserHref(browser) !== loadingThemePollHref) return;
@@ -1999,13 +2468,52 @@
   }
 
   function startLoadingThemePolling(browser = gBrowser?.selectedBrowser || null) {
-    stopLoadingThemePolling();
     if (!browser) return;
 
+    const href = getBrowserHref(browser);
+    const sameLoadingTarget = loadingThemePollBrowser === browser && loadingThemePollHref === href;
+    stopLoadingThemePolling();
+    if (!sameLoadingTarget) {
+      resetThemeArbitration(href);
+    }
+
     loadingThemePollBrowser = browser;
-    loadingThemePollHref = getBrowserHref(browser);
+    loadingThemePollHref = href;
     loadingThemePollStartedAt = Date.now();
     loadingThemePollTimer = setTimeout(scheduleLoadingThemePollTick, 60);
+  }
+
+  function stopActiveThemeRefresh() {
+    if (activeThemeRefreshTimer) clearTimeout(activeThemeRefreshTimer);
+    activeThemeRefreshTimer = 0;
+  }
+
+  function runActiveThemeRefresh() {
+    activeThemeRefreshTimer = 0;
+
+    const browser = gBrowser?.selectedBrowser || null;
+    if (!browser) {
+      scheduleActiveThemeRefresh();
+      return;
+    }
+
+    const expectedHref = getBrowserHref(browser);
+    void updateActive({
+      reason: 'active-refresh',
+      skipToolbarFallback: true
+    }).finally(() => {
+      const selected = gBrowser?.selectedBrowser || null;
+      if (!selected) return;
+      if (selected === browser && getBrowserHref(selected) !== expectedHref) {
+        void updateActive({ reason: 'active-refresh-navigation' });
+      }
+      scheduleActiveThemeRefresh();
+    });
+  }
+
+  function scheduleActiveThemeRefresh() {
+    stopActiveThemeRefresh();
+    activeThemeRefreshTimer = setTimeout(runActiveThemeRefresh, activeThemeRefreshIntervalMs);
   }
 
   function clearScheduledThemeUpdates() {
@@ -2066,6 +2574,7 @@
 
     gBrowser.tabContainer.addEventListener('TabSelect', () => {
       observeViewportThemeTarget();
+      scheduleActiveThemeRefresh();
       void updateActive({ reason: 'tab-select' });
     });
 
@@ -2077,10 +2586,13 @@
           if (viewportThemeUpdateTimer) clearTimeout(viewportThemeUpdateTimer);
           if (viewportResizeObserver) viewportResizeObserver.disconnect();
           stopLoadingThemePolling();
+          stopActiveThemeRefresh();
+          clearPendingThemeCandidate();
         });
       }
     } catch {}
     observeViewportThemeTarget();
+    scheduleActiveThemeRefresh();
 
     const pl = {
       onLocationChange(browserArg, webProgress, req, location, flags) {
@@ -2089,6 +2601,7 @@
           const isTop = webProgress && webProgress.isTopLevel;
           const matches = browserArg === active;
           if (isTop && matches) {
+            scheduleActiveThemeRefresh();
             startLoadingThemePolling(browserArg);
             scheduleActiveUpdates(
               earlyThemeUpdateDelays,
@@ -2110,6 +2623,7 @@
           const startFlag = listener ? listener.STATE_START : 0x00000001;
           const stopFlag = listener ? listener.STATE_STOP : 0x00000010;
           if (flags & startFlag) {
+            scheduleActiveThemeRefresh();
             startLoadingThemePolling(browserArg);
             scheduleActiveUpdates(
               earlyThemeUpdateDelays,

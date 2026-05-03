@@ -3,7 +3,7 @@
 ## Ready
 
 - Name: `Blended Addressbar` (18 characters).
-- Version: `0.8.11`.
+- Version: `0.9.0`.
 - Description: `A page-aware addressbar that blends Zen chrome with the active website.` (71 characters).
 - Metadata: `theme.json`.
 - Preferences: `preferences.json`.
@@ -14,7 +14,7 @@
 
 - Publish the mod in a public GitHub repository.
 - Add a license file so the mod is explicitly open source.
-- Add a marketplace screenshot image. Zen Mods Registry expects a `600x400` PNG.
+- Add a marketplace screenshot image. Zen Mods Registry expects a `600x400` PNG. Candidate: `blended-addressbar.png`.
 - Confirm `homepage` in `theme.json` points to the public repository URL.
 - For Sine store listing, use absolute public URLs for `readme` and `image` in the marketplace entry.
 
@@ -27,9 +27,9 @@
   "description": "A page-aware addressbar that blends Zen chrome with the active website.",
   "homepage": "https://github.com/kkugot/blended-addressbar",
   "readme": "https://raw.githubusercontent.com/kkugot/blended-addressbar/main/README.md",
-  "image": "https://raw.githubusercontent.com/kkugot/blended-addressbar/main/image.png",
+  "image": "https://raw.githubusercontent.com/kkugot/blended-addressbar/main/blended-addressbar.png",
   "author": "Kostiantyn Kugot",
-  "version": "0.8.11",
+  "version": "0.9.0",
   "updatedAt": "2026-05-03",
   "style": {
     "chrome": "style.css",
