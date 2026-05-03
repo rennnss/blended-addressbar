@@ -22,7 +22,7 @@
   const loadingThemePollSlowIntervalMs = 650;
   const loadingThemePollAggressiveWindowMs = 3500;
   const loadingThemePollMaxMs = 45000;
-  const loadingSamplingEnabled = true;
+  const loadingSamplingEnabled = false;
   const loadingSamplingIntervalMs = 120;
   const sampledColorMinAlpha = 0.08;
   const fallbackThemeStableDelayMs = 350;
@@ -114,12 +114,9 @@
     return {
       'dark-reader': 5,
       'theme-color': 5,
-      nav: 4,
-      header: 4,
       body: 3,
       html: 3,
       'document-canvas': 3,
-      visible: 2,
       sampler: 1,
       'chrome-contrast-fallback': 1,
       'toolbar-fallback': 0
@@ -254,10 +251,12 @@
   function applyResolvedTheme(browser, theme, reason, expectedHref = null, options = {}) {
     if (!theme?.bg || !browser || browser !== gBrowser?.selectedBrowser) return false;
     if (expectedHref && getBrowserHref(browser) !== expectedHref) return false;
+    if (expectedHref && theme.href && theme.href !== expectedHref) return false;
 
     const visibleTheme = hasVisibleColor(theme.bg)
       ? theme
       : getChromeContrastFallbackTheme(browser, 'chrome-contrast-fallback');
+
     const href = getBrowserHref(browser);
     ensureThemeArbitrationHref(href);
 
@@ -682,29 +681,7 @@
       current = current.parentElement;
     }
 
-    const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
-    const linkCandidates = [];
-    const textCandidates = [];
-    let inspected = 0;
-    for (const descendant of descendants) {
-      if (inspected >= 32) break;
-      if (!isRenderedElement(view, descendant)) continue;
-
-      const style = view.getComputedStyle(descendant);
-      const linkLike = isLinkLikeElement(descendant);
-      const target = linkLike ? linkCandidates : textCandidates;
-      const priority = linkLike ? 'link' : 'text';
-      addColorCandidate(target, style.color, priority);
-      addColorCandidate(target, style.fill, priority);
-      addColorCandidate(target, style.stroke, priority);
-      inspected++;
-    }
-
-    return [
-      ...linkCandidates,
-      ...textCandidates,
-      ...candidates
-    ];
+    return candidates;
   }
 
   function getReadableForeground(bg, candidates = []) {
@@ -892,18 +869,15 @@
       const root = doc?.documentElement;
       if (!doc || !view || !root) return null;
 
-      const visibleElement = getTopVisibleElement(view, doc);
-      const navElement = getFirstRenderedElement(view, doc, 'nav');
-      const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
+      const href = doc.location?.href || '';
+      const browserHref = browser?.currentURI?.spec || '';
+      if (browserHref && href && href !== browserHref) return null;
+
       const candidates = {
-        header: describeElementTheme(view, headerElement),
-        nav: describeElementTheme(view, navElement),
         body: describeElementTheme(view, doc.body),
-        visible: describeElementTheme(view, visibleElement),
         html: describeElementTheme(view, root)
       };
 
-      const href = browser?.currentURI?.spec || '';
       const withMeta = (theme) => theme && ({
         ...theme,
         bridge: 'chrome',
@@ -911,14 +885,11 @@
         candidates
       });
 
-      return withMeta(getThemeFromElement(view, navElement, 'nav', false))
-        || withMeta(getDarkReaderTheme(doc, view))
-        || withMeta(getThemeFromElement(view, headerElement, 'header'))
+      return withMeta(getDarkReaderTheme(doc, view))
         || withMeta(getThemeColorTheme(doc, view))
         || withMeta(getThemeFromElement(view, doc.body, 'body'))
         || withMeta(getThemeFromElement(view, root, 'html'))
-        || withMeta(getDocumentCanvasTheme(doc, view))
-        || withMeta(getThemeFromElement(view, visibleElement, 'visible'));
+        || withMeta(getDocumentCanvasTheme(doc, view));
     } catch (error) {
       if (DEBUG_VERBOSE) console.warn('[blended-addressbar:urlbar] Unable to read page theme', error);
       return null;
@@ -1203,29 +1174,7 @@
             current = current.parentElement;
           }
 
-          const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
-          const linkCandidates = [];
-          const textCandidates = [];
-          let inspected = 0;
-          for (const descendant of descendants) {
-            if (inspected >= 32) break;
-            if (!isRenderedElement(view, descendant)) continue;
-
-            const style = view.getComputedStyle(descendant);
-            const linkLike = isLinkLikeElement(descendant);
-            const target = linkLike ? linkCandidates : textCandidates;
-            const priority = linkLike ? 'link' : 'text';
-            addColorCandidate(target, style.color, priority);
-            addColorCandidate(target, style.fill, priority);
-            addColorCandidate(target, style.stroke, priority);
-            inspected++;
-          }
-
-          return [
-            ...linkCandidates,
-            ...textCandidates,
-            ...ancestorCandidates
-          ];
+          return ancestorCandidates;
         };
 
         const getReadableForeground = (bg, candidates = []) => {
@@ -1420,26 +1369,17 @@
             return;
           }
 
-          const visibleElement = getTopVisibleElement(view, doc);
-          const navElement = getFirstRenderedElement(view, doc, 'nav');
-          const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
           const candidates = {
-            header: describeElementTheme(view, headerElement),
-            nav: describeElementTheme(view, navElement),
             body: describeElementTheme(view, doc.body),
-            visible: describeElementTheme(view, visibleElement),
             html: describeElementTheme(view, root)
           };
 
           const href = content.location.href;
-          const theme = withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
-            || withMeta(getDarkReaderTheme(doc, view), href, candidates)
-            || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
+          const theme = withMeta(getDarkReaderTheme(doc, view), href, candidates)
             || withMeta(getThemeColorTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
             || withMeta(getThemeFromElement(view, root, 'html'), href, candidates)
-            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates)
-            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates);
+            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates);
 
           send({ ok: true, theme, candidates, href });
         } catch (error) {
@@ -1792,29 +1732,7 @@
             current = current.parentElement;
           }
 
-          const descendants = element.querySelectorAll?.('a,button,[role="button"],[role="link"],[aria-label],svg,span,p,li,h1,h2,h3,h4,h5,h6') || [];
-          const linkCandidates = [];
-          const textCandidates = [];
-          let inspected = 0;
-          for (const descendant of descendants) {
-            if (inspected >= 32) break;
-            if (!isRenderedElement(view, descendant)) continue;
-
-            const style = view.getComputedStyle(descendant);
-            const linkLike = isLinkLikeElement(descendant);
-            const target = linkLike ? linkCandidates : textCandidates;
-            const priority = linkLike ? 'link' : 'text';
-            addColorCandidate(target, style.color, priority);
-            addColorCandidate(target, style.fill, priority);
-            addColorCandidate(target, style.stroke, priority);
-            inspected++;
-          }
-
-          return [
-            ...linkCandidates,
-            ...textCandidates,
-            ...ancestorCandidates
-          ];
+          return ancestorCandidates;
         };
 
         const getReadableForeground = (bg, candidates = []) => {
@@ -2004,26 +1922,17 @@
           const root = doc?.documentElement;
           if (!doc || !view || !root) return null;
 
-          const visibleElement = getTopVisibleElement(view, doc);
-          const navElement = getFirstRenderedElement(view, doc, 'nav');
-          const headerElement = getFirstRenderedElement(view, doc, 'header,[role="banner"],#masthead');
           const candidates = {
-            header: describeElementTheme(view, headerElement),
-            nav: describeElementTheme(view, navElement),
             body: describeElementTheme(view, doc.body),
-            visible: describeElementTheme(view, visibleElement),
             html: describeElementTheme(view, root)
           };
 
           const href = content.location.href;
-          return withMeta(getThemeFromElement(view, navElement, 'nav', false), href, candidates)
-            || withMeta(getDarkReaderTheme(doc, view), href, candidates)
-            || withMeta(getThemeFromElement(view, headerElement, 'header'), href, candidates)
+          return withMeta(getDarkReaderTheme(doc, view), href, candidates)
             || withMeta(getThemeColorTheme(doc, view), href, candidates)
             || withMeta(getThemeFromElement(view, doc.body, 'body'), href, candidates)
             || withMeta(getThemeFromElement(view, root, 'html'), href, candidates)
-            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates)
-            || withMeta(getThemeFromElement(view, visibleElement, 'visible'), href, candidates);
+            || withMeta(getDocumentCanvasTheme(doc, view), href, candidates);
         } catch {
           return null;
         }
@@ -2094,12 +2003,19 @@
     };
   }
 
-  function getContrastingChromeBackground(baseColor) {
-    const luminance = getRelativeLuminance(baseColor);
-    const target = luminance > 0.5
-      ? { r: 0, g: 0, b: 0 }
-      : { r: 255, g: 255, b: 255 };
-    return mixRgb(baseColor, target, 0.1);
+  function getChromeFallbackOverlay(baseColor, colorScheme = '') {
+    const normalizedScheme = String(colorScheme || '').trim().toLowerCase();
+    const shouldLighten = normalizedScheme === 'light'
+      || (normalizedScheme !== 'dark' && getRelativeLuminance(baseColor) > 0.5);
+    const target = shouldLighten
+      ? { r: 255, g: 255, b: 255 }
+      : { r: 0, g: 0, b: 0 };
+    const amount = 0.1;
+
+    return {
+      bg: rgbaToCss({ ...target, a: amount }),
+      composite: mixRgb(baseColor, target, amount)
+    };
   }
 
   function getSampledTheme(result, browser = gBrowser?.selectedBrowser || null) {
@@ -2158,17 +2074,19 @@
     const toolbarFg = getComputedStyle(probe).color;
     probe.remove();
 
-    const rootBg = getComputedStyle(chromeDoc.documentElement).backgroundColor;
+    const rootStyle = getComputedStyle(chromeDoc.documentElement);
+    const rootBg = rootStyle.backgroundColor;
+    const colorScheme = rootStyle.getPropertyValue('--toolbar-color-scheme') || rootStyle.colorScheme;
     const baseBg = [toolbarBg, rootBg, 'Canvas'].find(hasVisibleColor) || 'Canvas';
     const baseRgb = parseCssRgb(baseBg) || { r: 255, g: 255, b: 255 };
-    const bg = rgbToCss(getContrastingChromeBackground(baseRgb));
-    const fg = getReadableForeground(bg, [
+    const fallback = getChromeFallbackOverlay(baseRgb, colorScheme);
+    const fg = getReadableForeground(rgbToCss(fallback.composite), [
       { value: toolbarFg, priority: 'text' },
-      chooseForeground(parseCssRgb(bg) || baseRgb)
+      chooseForeground(fallback.composite)
     ]);
 
     return {
-      bg,
+      bg: fallback.bg,
       fg,
       bridge: 'chrome',
       source: reason,
