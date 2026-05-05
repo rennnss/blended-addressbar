@@ -146,6 +146,16 @@
         fill: currentColor;
     }
 
+    #TabsToolbar.browser-toolbar.browser-titlebar {
+        background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+        color: var(--zen-tab-header-foreground, inherit);
+        fill: currentColor;
+        --toolbox-textcolor: currentColor;
+        --toolbarbutton-icon-fill: currentColor;
+        --toolbar-color: currentColor;
+        --toolbar-field-color: currentColor;
+    }
+
     /* Sidebar */
     #sidebar-box {
         background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
