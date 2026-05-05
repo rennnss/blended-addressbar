@@ -128,6 +128,24 @@
         --zen-toolbar-element-bg: transparent;
     }
 
+    /* Tab sidebar */
+    #tabbrowser-tabs[orient="vertical"],
+    #tabbrowser-tabs[orient="vertical"] #tabbrowser-arrowscrollbox,
+    #tabbrowser-tabs[orient="vertical"] #tabbrowser-arrowscrollbox-periphery {
+        background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+        color: var(--zen-tab-header-foreground, inherit);
+        fill: currentColor;
+        --toolbox-textcolor: currentColor;
+        --toolbarbutton-icon-fill: currentColor;
+        --toolbar-color: currentColor;
+        --toolbar-field-color: currentColor;
+    }
+
+    #tabbrowser-tabs[orient="vertical"] .tabbrowser-tab {
+        color: inherit;
+        fill: currentColor;
+    }
+
     /* Sidebar */
     #sidebar-box {
         border-radius: 0 !important;
