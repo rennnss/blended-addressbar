@@ -148,6 +148,23 @@
 
     /* Sidebar */
     #sidebar-box {
+        background-color: var(--zen-tab-header-background, var(--zen-main-browser-background-toolbar));
+        color: var(--zen-tab-header-foreground, inherit);
+        fill: currentColor;
+        --toolbox-textcolor: currentColor;
+        --toolbarbutton-icon-fill: currentColor;
+        --toolbar-color: currentColor;
+        --toolbar-field-color: currentColor;
         border-radius: 0 !important;
+    }
+
+    #sidebar-box #sidebar,
+    #sidebar-box #sidebar-header,
+    #sidebar-box #sidebar-header-toolbar,
+    #sidebar-box #sidebar-title,
+    #sidebar-box #sidebar-switcher-target {
+        background-color: transparent;
+        color: inherit;
+        fill: currentColor;
     }
 }
